@@ -22,15 +22,17 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
     /// 角色"身份"：ObjectIndex + 当前加载的骨架编号 + 外貌数据。Glamourer 换种族 / 体型、GPose 目标换成另一个角色时都会变，
     /// 界面据此丢弃缓存的参考姿势（骨长取自它，旧角色的骨长套到新种族上会把身体拉长或压扁）。
     /// </summary>
-    public sealed record ActorIdentity(int Index, string Signature, string? Race);
+    /// <summary>ModelReady：模型已加载（Glamourer 换种族时会重建模型，期间读到的骨长不可靠）。</summary>
+    public sealed record ActorIdentity(int Index, string Signature, string? Race, bool ModelReady);
 
     /// <summary>必须在主线程调用。</summary>
     public unsafe ActorIdentity? Identify(int? actor)
     {
         if (!clientState.IsGPosing || Resolve(actor) is not { } a) return null;
-        var race = Races.FromModel(a) ?? Races.FromCharacter(a);
+        var model = Races.FromModel(a);
+        var race = model ?? Races.FromCharacter(a);
         var customize = a is ICharacter ch ? Convert.ToHexString(ch.Customize) : "";
-        return new ActorIdentity(a.ObjectIndex, $"{a.ObjectIndex}:{race}:{customize}", race);
+        return new ActorIdentity(a.ObjectIndex, $"{a.ObjectIndex}:{race}:{customize}", race, model is not null);
     }
 
     public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));

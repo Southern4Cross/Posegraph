@@ -282,6 +282,7 @@ public static partial class Loc
         ["下载加速前缀##proxy"] = "Download mirror prefix##proxy",
         ["检测到角色种族变化（{0}），已重新计算"] = "Actor race changed ({0}), recalculated",
         ["检测到角色外貌变化，已重新计算"] = "Actor appearance changed, recalculated",
+        ["并应用"] = " and applied",
         ["进入 GPose 且 Brio 就绪时自动打开界面"] = "Open automatically when entering GPose with Brio ready",
         ["连不上 GitHub 时可以填加速前缀（如 https://gh-proxy.org/），会加在下载地址前面；留空为直连"] = "If GitHub is unreachable, enter a mirror prefix (e.g. https://gh-proxy.org/); it is put in front of the download URL. Leave empty for a direct download",
     };

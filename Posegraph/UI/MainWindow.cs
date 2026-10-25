@@ -89,6 +89,9 @@ public sealed class MainWindow : Window, IDisposable
     private string? _raceOverride;      // 手动指定，null 为自动
     private string? _referenceSignature;   // 缓存的参考姿势属于哪个角色身份（PoseApplier.ActorIdentity）
     private string? _currentSignature;     // 当前角色身份，每秒刷新
+    private string? _pendingSignature;     // 检测到变化后等它稳定一秒（模型重建完）再重算
+    private int? _pushedIndex;             // 应用过姿势的角色：外貌变化重算后自动再应用
+    private string? _pushStatus;           // 下一次应用成功时显示的状态（代替"已应用到角色"）
     private readonly Dictionary<string, string> _backups = new();   // 身份 → 第一次应用前的姿势
 
     // 3D 视图
@@ -200,21 +203,34 @@ public sealed class MainWindow : Window, IDisposable
 
         // 角色变了（Glamourer 换种族 / 体型、GPose 目标换人）：丢弃缓存的参考姿势与种族，重新计算
         var id = _applier.Identify(_actor);
-        _currentSignature = id?.Signature;
         if (id is null) return;
         if (_reference is not null && _referenceSignature != id.Signature)
         {
+            // 模型重建中，或刚变化：等下一秒身份不再变化再读游戏骨长
+            if (!id.ModelReady || _pendingSignature != id.Signature)
+            {
+                _pendingSignature = id.Signature;
+                return;
+            }
+            _pendingSignature = null;
+            _currentSignature = id.Signature;
             var raceChanged = id.Race != _detectedRace;
             _reference = null;
             _detectedRace = id.Race;
             if (_session is not null)
             {
-                RequestRetarget(false);
-                SetStatus(raceChanged ? Loc.F("检测到角色种族变化（{0}），已重新计算", Races.Label(id.Race))
-                                      : Loc.T("检测到角色外貌变化，已重新计算"), Yellow);
+                var push = _pushedIndex == id.Index;
+                var message = raceChanged ? Loc.F("检测到角色种族变化（{0}），已重新计算", Races.Label(id.Race))
+                                          : Loc.T("检测到角色外貌变化，已重新计算");
+                if (push) _pushStatus = message + Loc.T("并应用");
+                else SetStatus(message, Yellow);
+                RequestRetarget(push);
             }
+            return;
         }
-        else if (_reference is null)
+        _pendingSignature = null;
+        _currentSignature = id.Signature;
+        if (_reference is null)
             _detectedRace = id.Race;
     }
 
@@ -511,8 +527,14 @@ public sealed class MainWindow : Window, IDisposable
             SetStatus(Loc.T("不在 GPose：只更新了预览"), Yellow);
             return;
         }
+        var status = _pushStatus ?? Loc.T("已应用到角色");
+        _pushStatus = null;
         var error = await _applier.ApplyAsync(_actor, pose);
-        if (error is null) SetStatus(Loc.T("已应用到角色"), Green);
+        if (error is null)
+        {
+            _pushedIndex = (await _applier.IdentifyAsync(_actor))?.Index;
+            SetStatus(status, Green);
+        }
         else SetError(error);
     }
 
@@ -689,6 +711,8 @@ public sealed class MainWindow : Window, IDisposable
         _actor = index;
         _reference = null;
         _referenceSignature = null;
+        _pendingSignature = null;
+        _pushedIndex = null;
         _detectedRace = null;
         _lastActors = DateTime.MinValue;
         RequestRetarget(false);
