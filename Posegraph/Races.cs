@@ -49,6 +49,20 @@ public static class Races
         return id > 0 ? $"c{id:0000}" : null;
     }
 
+    /// <summary>
+    /// 能不能摆姿势：人形模型（玩家、Brio 新建的角色、雇员等人形 NPC）。宠物、坐骑、怪物、道具等骨架套不上，排除。
+    /// 模型还没加载（换种族重建中）时只按对象类型判断，免得列表里的角色闪一下就没了。必须在主线程调用。
+    /// </summary>
+    public static unsafe bool IsPoseable(IGameObject? obj)
+    {
+        if (obj is null || obj.Address == 0) return false;
+        if (obj.ObjectKind is ObjectKind.Companion or ObjectKind.Mount or ObjectKind.Ornament) return false;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address;
+        var draw = (FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase*)go->DrawObject;
+        if (draw == null) return obj is ICharacter;
+        return draw->GetModelType() == FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase.ModelType.Human;
+    }
+
     /// <summary>按角色外貌数据（种族、部族、性别）得到骨架编号；非人形模型（坐骑、怪物等）返回 null。必须在主线程调用。</summary>
     public static string? FromCharacter(IGameObject? obj)
     {

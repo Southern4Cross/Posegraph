@@ -83,14 +83,16 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
 
 ## Usage
 
-1. Enter GPose and select the actor (or pick one in the actor list).
+1. Enter GPose and select the actor (or pick one in the actor list, which shows players, actors created in Brio
+   and humanoid NPCs such as retainers).
 2. Click the folder icon or drag an image onto the *Image* tab (jpg, png, webp, bmp, gif first frame, tiff, avif).
 3. The first recognition loads the model (about 10–20 s); after that a recognition takes a few seconds.
 4. Check the overlay (*Image* tab: green = detected skeleton, orange = FFXIV skeleton) and the *3D* tab.
 5. Tune on the *Tuning* tab, read the *Hints* tab, then **Apply** (▶). Use the camera button to match the photo camera,
    ↶ to restore the pose from before the first apply, and the disk button to export a `.pose` file.
 
-Status bar icons, left to right: Brio, GPose, backend, VRAM, RAM; hover for details.
+Status bar icons, left to right: Brio, GPose, IVCS (shown once the game pose has been read), backend, VRAM, RAM;
+hover for details.
 
 ### Settings
 
@@ -113,6 +115,10 @@ Status bar icons, left to right: Brio, GPose, backend, VRAM, RAM; hover for deta
 | Female skeletons | all | **not supported yet** |
 
 If the detected race is wrong (race-changing mods, Customize+ scaling), choose it manually in the race list next to the actor list.
+The choice is remembered per actor for the GPose session; switching between actors does not clear their poses in Brio.
+
+The skeleton data comes from IVCS. Actors without the IVCS skeleton work too: the bend of each finger's third joint is
+merged into the second, and the IVCS icon in the status bar turns yellow.
 
 ## Known limitations
 
@@ -179,9 +185,10 @@ The backend (127.0.0.1:42430) exposes `GET /health`, `POST /sessions`, `GET /ses
 
 ## License
 
-Posegraph's own code (plugin, backend, scripts) is licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE): free to use, modify and share for noncommercial purposes;
-commercial use is not permitted. Third-party components keep their own licenses.
+Posegraph's own code (plugin, backend, scripts) is licensed under the [MIT License](LICENSE)
+(versions up to 0.3.8 were released under the PolyForm Noncommercial License 1.0.0).
+Third-party components keep their own licenses; in particular, the SAM 3D Body code and weights shipped in the
+backend package are under Meta's SAM License.
 
 ## Credits
 

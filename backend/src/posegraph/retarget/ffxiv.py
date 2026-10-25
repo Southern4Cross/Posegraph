@@ -475,7 +475,8 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
              offsets: dict[str, tuple[float, float, float]] | None = None,
              hand_strength: float = 1.0, hand_near: float = HAND_CONTACT_NEAR, hand_far: float = HAND_CONTACT_FAR,
              upright_max_deg: float = UPRIGHT_MAX_DEG, helper_strength: float = 1.0,
-             rest_vertices: np.ndarray | None = None, reference_lengths: bool = True) -> RetargetResult:
+             rest_vertices: np.ndarray | None = None, reference_lengths: bool = True,
+             ivcs: bool = True) -> RetargetResult:
     """joint_global_rots: (127,3,3) SAM 3D Body 输出 pred_global_rots；
     joint_coords_cam: (127,3) pred_joint_coords（相机系，仅用于自检）；
     rest_coords / rest_rots: 该人物体型下的零姿态（缺省用平均体型 mhr_rest.json，骨段方向会有几度系统误差）；
@@ -497,7 +498,9 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
     helper_strength: 辅助骨联动强度（1 为游戏采样拟合值）；
     rest_vertices: 该人物零姿态网格顶点（MHR 模型系），给出时手部末端补偿按头 / 胸 / 髋实际尺寸换算接触位置；
     ground: 自动贴地。n_hara 的高度固定在站立高度，倒立/跪坐/躺下时角色会悬空，
-    开启后把最低的关节平移到绑定姿势中最低关节的高度（跳跃照片也会被按到地面上）。"""
+    开启后把最低的关节平移到绑定姿势中最低关节的高度（跳跃照片也会被按到地面上）；
+    ivcs: 游戏角色加载了 IVCS 骨骼。False 时手指第三节（iv_*_c）的弯曲取一半并入第二节，输出不含 iv_ 骨骼
+    （原版骨架没有第三节，第二节的蒙皮一直覆盖到指尖）。脚趾 iv_asi_* 本来就不驱动，没有可折算的。"""
     sk = _with_reference_lengths(load_ffxiv_skeleton(race), reference if reference_lengths else None)
     mhr_names, mean_pos, mean_rot = load_mhr_rest()
     mhr_rest_pos = mean_pos if rest_coords is None else rest_coords
@@ -557,6 +560,15 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
             if G_new[j] is not None:
                 G_new[j] = rw * G_new[j]
         G, P = forward_kinematics(sk, G_new)
+    if not ivcs:
+        # 第三节超出"随第二节刚性转动"的部分（模型系），一半加到第二节：第二节就大致指向第二、三节合起来的方向，
+        # 握拳不会变成伸直的手指
+        for s in "lr":
+            for ff in ("hito", "naka", "kusu", "ko"):
+                b, c = sk.index(f"j_{ff}_b_{s}"), sk.index(f"iv_{ff}_c_{s}")
+                extra = G[c] * (G[b] * sk.local_r[c]).inv()
+                G_new[b] = R.from_rotvec(0.5 * extra.as_rotvec()) * G[b]
+        G, P = forward_kinematics(sk, G_new)
     if upright_rot is not None:
         compensation["upright_deg"] = round(float(np.degrees(upright_rot.magnitude())), 1)
 
@@ -591,7 +603,8 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
         t = reference.get(name) if reference is not None else None
         return t.scale if t is not None else np.ones(3)
 
-    bones = {sk.names[i]: (P[i], G[i].as_quat(), scale_of(sk.names[i])) for i in sorted(keep)}
+    bones = {sk.names[i]: (P[i], G[i].as_quat(), scale_of(sk.names[i])) for i in sorted(keep)
+             if ivcs or not sk.names[i].startswith("iv_")}
 
     errors: dict[str, float] = {}
     # 自检只看纯角度复制的骨骼：末端补偿过的骨骼本来就会偏离照片角度

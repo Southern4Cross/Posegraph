@@ -72,13 +72,13 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 
 ## 使用
 
-1. 进入 GPose，选中要摆姿势的角色（或在角色列表里选）。
+1. 进入 GPose，选中要摆姿势的角色（或在角色列表里选；列表只列玩家、Brio 新建的角色和雇员等人形 NPC）。
 2. 点文件夹按钮，或把图片拖到「图像」页（jpg、png、webp、bmp、gif 首帧、tiff、avif）。
 3. 首次识别会加载模型（约 10~20 秒），之后每张几秒。
 4. 看「图像」页叠加层（绿 = 识别骨架，橙 = FF14 骨架）和「3D」页。
 5. 在「调整」页微调，看「提示」页，然后点 **应用**（▶）。相机按钮复刻照片镜头，↶ 还原第一次应用前的姿势，磁盘按钮导出 `.pose`。
 
-状态栏图标从左到右：Brio、GPose、后端、显存、内存，鼠标悬停看详情。
+状态栏图标从左到右：Brio、GPose、IVCS（读到游戏姿势后显示）、后端、显存、内存，鼠标悬停看详情。
 
 ### 设置
 
@@ -101,6 +101,9 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 | 女性骨架 | 全部 | **尚未适配** |
 
 识别出的种族不对时（换种族 MOD、Customize+ 改体型），在角色列表旁的种族下拉框里手动指定。
+手动指定按角色分别记住（本次 GPose 内）；在角色之间切换不会清除它们在 Brio 里的姿势。
+
+骨架数据来自 IVCS。角色没有加载 IVCS 骨骼时也能用：手指第三节的弯曲会合并到第二节，状态栏 IVCS 图标显示黄色。
 
 ## 已知限制
 
@@ -164,8 +167,8 @@ powershell -ExecutionPolicy Bypass -File packaging\build_backend_package.ps1 `
 
 ## 许可证
 
-Posegraph 自身的代码（插件、后端、脚本）以 [PolyForm Noncommercial License 1.0.0](LICENSE) 授权：
-可以免费用于非商业用途，并修改、分享；不允许商业使用。第三方组件仍按各自的许可证。
+Posegraph 自身的代码（插件、后端、脚本）以 [MIT 许可证](LICENSE) 授权（0.3.8 及之前的版本为 PolyForm Noncommercial License 1.0.0）。
+第三方组件仍按各自的许可证，其中后端一键包附带的 SAM 3D Body 代码与权重为 Meta 的 SAM License。
 
 ## 致谢
 

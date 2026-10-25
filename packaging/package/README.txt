@@ -29,5 +29,5 @@ Posegraph 后端源码、SAM 3D Body 源码与模型权重。
 要求：Windows 10/11 64 位。有 NVIDIA 显卡且可用显存约 3GB 时用显卡，否则用 CPU（每张约 10~20 秒，内存约 4GB）。
 
 Licenses / 许可证: see the LICENSES folder.
-Posegraph itself: PolyForm Noncommercial License 1.0.0 (noncommercial use only / 仅限非商业用途).
+Posegraph itself: MIT License / MIT 许可证.
 SAM 3D Body (code and weights) is released under the SAM License by Meta; other components keep their own licenses.

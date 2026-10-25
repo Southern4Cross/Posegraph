@@ -289,6 +289,9 @@ public static partial class Loc
         ["关闭时与游戏界面一起隐藏（如 GPose 里隐藏界面截图）。界面不显示时可以打开试试"] = "When off, the window hides together with the game UI (e.g. hiding the UI in GPose for screenshots). Try turning this on if the window does not show up",
         ["调整过的值按预设自动保存，点右边的按钮恢复默认"] = "Adjusted values are saved per preset automatically; the button on the right restores the defaults",
         ["进入 GPose 且 Brio 就绪时自动打开界面"] = "Open automatically when entering GPose with Brio ready",
+        ["已切换到 {0}，已重新计算"] = "Switched to {0}, recalculated",
+        ["IVCS：已加载"] = "IVCS: loaded",
+        ["IVCS：未检测到（手指第三节的弯曲已合并到第二节；装上 IVCS 手指会更准）"] = "IVCS: not detected (the bend of each finger's third joint is merged into the second; fingers are more accurate with IVCS)",
         ["连不上 GitHub 时可以填加速前缀（如 https://gh-proxy.org/），会加在下载地址前面；留空为直连"] = "If GitHub is unreachable, enter a mirror prefix (e.g. https://gh-proxy.org/); it is put in front of the download URL. Leave empty for a direct download",
     };
 }

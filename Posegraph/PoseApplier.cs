@@ -19,11 +19,13 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
         clientState.IsGPosing && Resolve(actor) is { } a ? brio.GetPose(a) : null);
 
     /// <summary>
-    /// 角色"身份"：ObjectIndex + 当前加载的骨架编号 + 外貌数据。Glamourer 换种族 / 体型、GPose 目标换成另一个角色时都会变，
-    /// 界面据此丢弃缓存的参考姿势（骨长取自它，旧角色的骨长套到新种族上会把身体拉长或压扁）。
+    /// 角色"身份"。Key：是哪个角色（ObjectIndex + 类型 + BaseId + 名字，Glamourer 换外貌不变，Brio 删掉再新建会变）；
+    /// Signature：这个角色当前的样子（Key + 骨架编号 + 外貌数据，Glamourer 换种族 / 体型时会变）。
+    /// 界面按 Key 区分"换了一个角色"和"同一个角色换了外貌"：只有后者需要丢弃参考姿势、清除 Brio 残留姿势
+    /// （旧角色的骨长套到新种族上会把身体拉长或压扁）。
+    /// ModelReady：模型已加载（Glamourer 换种族时会重建模型，期间读到的骨长不可靠）。
     /// </summary>
-    /// <summary>ModelReady：模型已加载（Glamourer 换种族时会重建模型，期间读到的骨长不可靠）。</summary>
-    public sealed record ActorIdentity(int Index, string Signature, string? Race, bool ModelReady);
+    public sealed record ActorIdentity(int Index, string Key, string Signature, string? Race, bool ModelReady);
 
     /// <summary>必须在主线程调用。</summary>
     public unsafe ActorIdentity? Identify(int? actor)
@@ -32,7 +34,8 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
         var model = Races.FromModel(a);
         var race = model ?? Races.FromCharacter(a);
         var customize = a is ICharacter ch ? Convert.ToHexString(ch.Customize) : "";
-        return new ActorIdentity(a.ObjectIndex, $"{a.ObjectIndex}:{race}:{customize}", race, model is not null);
+        var key = $"{a.ObjectIndex}:{a.ObjectKind}:{a.BaseId}:{a.Name.TextValue}";
+        return new ActorIdentity(a.ObjectIndex, key, $"{key}:{race}:{customize}", race, model is not null);
     }
 
     public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));

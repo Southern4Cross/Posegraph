@@ -274,6 +274,17 @@ class RetargetRequest(BaseModel):
     trust_reference: bool = False   # 插件已清除过 Brio 姿势栈：骨长不符也按游戏实际值（Customize+、改体型 MOD）
 
 
+def _ivcs(ref: BrioPose | None, race: dict) -> bool | None:
+    """游戏角色是否加载了 IVCS 骨骼（Brio 读回的姿势含骨架里的全部骨骼，有 iv_ 骨骼就是装了）。
+    没有游戏姿势时为 None（按装了计算）；没装时把提示加到 race["warnings"]。"""
+    if ref is None:
+        return None
+    if any(name.startswith("iv_") for name in ref.bone_names):
+        return True
+    race["warnings"].append(tr("未检测到 IVCS 骨骼：手指第三节的弯曲已合并到第二节"))
+    return False
+
+
 def _reference_lengths(ref: BrioPose | None, race: dict, trust: bool) -> tuple[bool, bool]:
     """返回 (骨长是否取游戏值, 游戏骨长是否像残留的旧姿势)，并把提示加到 race["warnings"]。
     换种族后 Brio 会把按旧骨架算的位置增量继续叠加在新骨架上，读回的骨长是错的，而且重新应用也恢复不了
@@ -330,10 +341,12 @@ def session_retarget(sid: str, req: RetargetRequest) -> dict:
     ref = BrioPose.loads(req.reference) if req.reference else None
     race = _resolve_race(req.race, ref)
     use_lengths, stale = _reference_lengths(ref, race, req.trust_reference)
-    rt = tuning.run(human, s.image_size, req.params, ref, race["code"], reference_lengths=use_lengths)
+    ivcs = _ivcs(ref, race)
+    rt = tuning.run(human, s.image_size, req.params, ref, race["code"], reference_lengths=use_lengths,
+                    ivcs=ivcs is not False)
     warnings, severity = tuning.check(rt, race["code"])
     out = {"pose": to_brio_pose_json(rt), "warnings": warnings, "severity": severity,
-           "compensation": rt.hand_compensation, "race": race, "referenceStale": stale}
+           "compensation": rt.hand_compensation, "race": race, "referenceStale": stale, "ivcs": ivcs}
     if req.overlay:
         out["overlay"] = tuning.overlay(human, s.image_size, rt, race["code"])
     if req.stick:
@@ -362,7 +375,7 @@ def session_camera(sid: str, req: CameraRequest) -> dict:
     ref = BrioPose.loads(pose_json)
     race = _resolve_race(req.race, ref)
     rt = tuning.run(human, s.image_size, req.params, ref, race["code"],
-                    reference_lengths=_reference_lengths(ref, race, False)[0])
+                    reference_lengths=_reference_lengths(ref, race, False)[0], ivcs=_ivcs(ref, race) is not False)
     model = ref.raw["ModelAbsoluteValues"]
     vec = lambda v: np.array([float(x) for x in v.split(",")])
     target = photo_camera_in_world(human, rt, vec(model["Position"]), vec(model["Rotation"]), vec(model["Scale"]),

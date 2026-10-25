@@ -58,6 +58,8 @@ EN = {
     "无法确定种族，按人族中原男计算": "Could not determine the race; using Midlander Hyur (M)",
     "（没有 {code} 的骨架数据）": " (no skeleton data for {code})",
     "{name}尚未适配（目前只适配男性骨架），姿势可能明显不对": "{name} is not supported yet (only male skeletons are); the pose may be clearly wrong",
+    "未检测到 IVCS 骨骼：手指第三节的弯曲已合并到第二节":
+        "IVCS skeleton not detected: the bend of each finger's third joint has been merged into the second",
     # 设备
     "手动指定": "set manually",
     "未检测到 NVIDIA 显卡": "no NVIDIA GPU detected",

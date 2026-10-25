@@ -97,6 +97,11 @@ public sealed class MainWindow : Window, IDisposable
     private readonly Dictionary<string, string> _backups = new();   // 身份 → 第一次应用前的姿势
     private bool _resetPending;                                     // 换了种族：下次应用前先清除 Brio 残留姿势
     private readonly HashSet<string> _cleanSignatures = new();      // 已清除过 Brio 姿势的身份：骨长不符也信游戏值
+    private string? _actorKey;                                      // 上面这些状态属于哪个角色（ActorIdentity.Key）
+    private readonly Dictionary<string, ActorState> _actorStates = new();   // 本次 GPose 里切换过的角色各自的状态
+
+    /// <summary>切走时记下的角色状态，切回来时恢复。Race：上次看到的骨架编号，切回来时不同说明在别处换过种族。</summary>
+    private sealed record ActorState(string? Race, string? RaceOverride, bool ResetPending);
 
     // 3D 视图
     private float _yaw, _pitch = 0.15f, _zoom = 1f;
@@ -202,13 +207,23 @@ public sealed class MainWindow : Window, IDisposable
     {
         if (DateTime.UtcNow - _lastActors < TimeSpan.FromSeconds(1)) return;
         _lastActors = DateTime.UtcNow;
-        _actors = _clientState.IsGPosing
-            ? _brio.GetActors().Select(a => ((int)a.ObjectIndex, a.Name.TextValue)).ToArray()
-            : [];
+        if (!_clientState.IsGPosing)
+        {
+            _actors = [];
+            if (_actorKey is not null || _actorStates.Count > 0) ForgetActors();
+            return;
+        }
+        _actors = _brio.GetActors().Where(Races.IsPoseable).Select(a => ((int)a.ObjectIndex, a.Name.TextValue)).ToArray();
 
-        // 角色变了（Glamourer 换种族 / 体型、GPose 目标换人）：丢弃缓存的参考姿势与种族，重新计算
         var id = _applier.Identify(_actor);
         if (id is null) return;
+        // 换了一个角色（GPose 目标换人、下拉框选了别人）：换成那个角色自己的状态，不当作换种族
+        if (id.Key != _actorKey)
+        {
+            SwitchActor(id);
+            return;
+        }
+        // 同一个角色外貌变了（Glamourer 换种族 / 体型）：丢弃参考姿势，重新计算
         if (_reference is not null && _referenceSignature != id.Signature)
         {
             // 模型重建中，或刚变化：等下一秒身份不再变化再读游戏骨长
@@ -240,6 +255,54 @@ public sealed class MainWindow : Window, IDisposable
             _detectedRace = id.Race;
     }
 
+    /// <summary>
+    /// 切换到另一个角色：记下当前角色的状态，换成新角色在本次 GPose 里上次的状态。
+    /// 不清除新角色的 Brio 姿势——除非切走期间它在别处换过种族（骨架编号与上次看到的不同）。
+    /// </summary>
+    private void SwitchActor(PoseApplier.ActorIdentity id)
+    {
+        SaveActorState();
+        var switched = _actorKey is not null;
+        _actorKey = id.Key;
+        var state = _actorStates.GetValueOrDefault(id.Key);
+        var raceChanged = state?.Race is { } old && id.ModelReady && old != id.Race;
+        // 进 GPose 前（还没有角色时）手动指定的种族留给第一个角色
+        if (switched || state is not null) _raceOverride = state?.RaceOverride;
+        _resetPending = state?.ResetPending == true || raceChanged;
+        _detectedRace = id.Race;
+        _reference = null;
+        _referenceSignature = null;
+        _pendingSignature = null;
+        _currentSignature = id.Signature;
+        if (_session is null) return;
+        if (raceChanged) SetStatus(Loc.F("检测到角色种族变化（{0}），已重新计算", Races.Label(id.Race)), Yellow);
+        else if (switched) SetStatus(Loc.F("已切换到 {0}，已重新计算", ActorName(id.Index)));
+        RequestRetarget(false);
+    }
+
+    private void SaveActorState()
+    {
+        if (_actorKey is not null)
+            _actorStates[_actorKey] = new ActorState(_detectedRace, _raceOverride, _resetPending);
+    }
+
+    /// <summary>退出 GPose：角色都没了，下次进 GPose 会重新分配 ObjectIndex，按角色记的状态全部作废。</summary>
+    private void ForgetActors()
+    {
+        _actorStates.Clear();
+        _backups.Clear();
+        _cleanSignatures.Clear();
+        _actorKey = null;
+        _reference = null;
+        _referenceSignature = null;
+        _pendingSignature = null;
+        _currentSignature = null;
+        _pushedIndex = null;
+        _resetPending = false;
+    }
+
+    private string ActorName(int index) => _actors.FirstOrDefault(a => a.Index == index).Name ?? $"#{index}";
+
     private static void StatusIcon(FontAwesomeIcon icon, Vector4 color, string tip)
     {
         using (ImRaii.PushFont(UiBuilder.IconFont))
@@ -270,6 +333,11 @@ public sealed class MainWindow : Window, IDisposable
         // GPose
         StatusIcon(FontAwesomeIcon.Camera, _clientState.IsGPosing ? Green : Grey,
                    _clientState.IsGPosing ? Loc.T("GPose：已进入") : Loc.T("GPose：未进入（只能预览和导出，不能应用到角色）"));
+
+        // IVCS（按最近一次计算时读到的游戏姿势判断）
+        if (_clientState.IsGPosing && _result?.Ivcs is { } ivcs)
+            StatusIcon(FontAwesomeIcon.HandPaper, ivcs ? Green : Yellow,
+                       ivcs ? Loc.T("IVCS：已加载") : Loc.T("IVCS：未检测到（手指第三节的弯曲已合并到第二节；装上 IVCS 手指会更准）"));
 
         // 后端
         var (icon, color, tip) = BackendState();
@@ -723,7 +791,7 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
 
         // 角色
-        var label = _actor is null ? Loc.T("GPose 目标") : _actors.FirstOrDefault(a => a.Index == _actor).Name ?? $"#{_actor}";
+        var label = _actor is { } actor ? ActorName(actor) : Loc.T("GPose 目标");
         ImGui.SetNextItemWidth(ComboWidth(label, 140));
         if (ImGui.BeginCombo("##actor", label))
         {
@@ -773,17 +841,11 @@ public sealed class MainWindow : Window, IDisposable
         return Math.Min(Math.Max(min * ImGuiHelpers.GlobalScale, want), Math.Max(60, ImGui.GetContentRegionAvail().X));
     }
 
+    /// <summary>下一帧刷新角色时按新角色切换状态并重新计算（见 SwitchActor）。</summary>
     private void SelectActor(int? index)
     {
         _actor = index;
-        _reference = null;
-        _referenceSignature = null;
-        _pendingSignature = null;
-        _pushedIndex = null;
-        _resetPending = false;
-        _detectedRace = null;
         _lastActors = DateTime.MinValue;
-        RequestRetarget(false);
     }
 
     /// <summary>种族骨架：默认按角色外貌自动识别，可手动指定（换种族 MOD、识别不到时）。</summary>

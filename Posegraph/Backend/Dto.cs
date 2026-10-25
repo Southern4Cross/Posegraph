@@ -58,7 +58,8 @@ public sealed record RaceUsed(string Code, string Name, string Group, bool Valid
 
 public sealed record RetargetResult(
     string Pose, PoseWarning[] Warnings, Dictionary<string, string> Severity,
-    JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race, bool ReferenceStale = false);
+    JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race, bool ReferenceStale = false,
+    bool? Ivcs = null);   // 游戏角色是否加载了 IVCS 骨骼（读到游戏姿势时才有）
 
 public sealed record CameraResult(float PositionErrorCm, float ForwardErrorDeg, float FovDeg, float TargetFovDeg,
                                   float FramingErrorPct, string[] Log);
