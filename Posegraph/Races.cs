@@ -15,11 +15,11 @@ public static class Races
     public static readonly Race[] All =
     [
         new("c0101", "人族中原 男", "中原系男", true),
-        new("c0301", "人族高地 男", "中原系男", false),
-        new("c0701", "猫魅 男", "中原系男", false),
-        new("c1301", "敖龙 男", "中原系男", false),
-        new("c1701", "维埃拉 男", "中原系男", false),
-        new("c0501", "精灵 男", "精灵男", false),
+        new("c0301", "人族高地 男", "中原系男", true),
+        new("c0701", "猫魅 男", "中原系男", true),
+        new("c1301", "敖龙 男", "中原系男", true),
+        new("c1701", "维埃拉 男", "中原系男", true),
+        new("c0501", "精灵 男", "精灵男", true),
         new("c0901", "鲁加 男", "鲁加系男", false),
         new("c1501", "硌狮 男", "鲁加系男", false),
         new("c1101", "拉拉菲尔 男", "拉拉菲尔", false),
@@ -37,6 +37,17 @@ public static class Races
     public static Race? Find(string? code) => All.FirstOrDefault(r => r.Code == code);
 
     public static string Label(string? code) => Find(code) is { } r ? Loc.T(r.Name) : code ?? Loc.T("未知");
+
+    /// <summary>角色当前实际加载的骨架编号（人形绘制对象的 RaceSexId，如 101 → c0101）；能反映换种族 MOD。读不到为 null。必须在主线程调用。</summary>
+    public static unsafe string? FromModel(IGameObject? obj)
+    {
+        if (obj is null || obj.Address == 0) return null;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address;
+        var draw = (FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase*)go->DrawObject;
+        if (draw == null || draw->GetModelType() != FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase.ModelType.Human) return null;
+        var id = ((FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Human*)draw)->RaceSexId;
+        return id > 0 ? $"c{id:0000}" : null;
+    }
 
     /// <summary>按角色外貌数据（种族、部族、性别）得到骨架编号；非人形模型（坐骑、怪物等）返回 null。必须在主线程调用。</summary>
     public static string? FromCharacter(IGameObject? obj)

@@ -48,12 +48,11 @@ EN = {
     "鲁加 女": "Roegadyn (F)", "硌狮 女": "Hrothgar (F)", "猫魅 女": "Miqo'te (F)", "敖龙 女": "Au Ra (F)", "拉拉菲尔 女": "Lalafell (F)",
     "中原系男": "Midlander-type (M)", "精灵男": "Elezen (M)", "鲁加系男": "Roegadyn-type (M)", "拉拉菲尔": "Lalafell",
     "中原系女": "Midlander-type (F)", "精灵系女": "Elezen-type (F)", "猫魅系女": "Miqo'te-type (F)",
-    "角色骨长更像{group}，可能装了改体型的 MOD，仍按{name}计算":
-        "The actor's bone lengths look like {group} (a body mod?); still using {name}",
+    "游戏角色的骨长更像{group}，与所选{name}不符（刚换过种族？改体型 MOD？），身体比例会不对":
+        "The actor's bone lengths look like {group}, not the selected {name} (race just changed? body mod?); proportions will be off",
     "没有 {code} 的骨架数据，按骨长推断为{group}": "No skeleton data for {code}; inferred {group} from bone lengths",
     "无法确定种族，按人族中原男计算": "Could not determine the race; using Midlander Hyur (M)",
     "（没有 {code} 的骨架数据）": " (no skeleton data for {code})",
-    "{name}尚未在游戏内实测，结果仅供参考": "{name} has not been tested in game yet; results may be off",
     "{name}尚未适配（目前只适配男性骨架），姿势可能明显不对": "{name} is not supported yet (only male skeletons are); the pose may be clearly wrong",
     # 设备
     "手动指定": "set manually",

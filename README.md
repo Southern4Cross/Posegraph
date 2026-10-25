@@ -22,7 +22,7 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 - **Photo and illustration support**, full or half body, fingers included. An *Illustration* preset tones down
   the exaggerated head/neck proportions of drawn art.
 - **All playable male races.** The race is read from the character's appearance (or chosen manually).
-  Midlander ♂ is verified in game; the other male races are marked *untested* in the UI.
+  Midlander-type and Elezen males are verified in game; Lalafell and Roegadyn/Hrothgar had a body-proportion bug after changing race, fixed in 0.3.2.
   Female skeletons are **not supported yet** (their data is included, but the retargeting rules are tuned for male skeletons).
 - **Live tuning without re-running the AI**: per-region amplitude (spine, neck, head, clavicle, wrist), hand contact
   compensation, gravity correction, ground snapping, helper-bone strength, and manual per-joint offsets in a 3D stick figure.
@@ -48,7 +48,7 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 ### 1. Backend package
 
-1. Download **Posegraph-Backend-win64.zip** (link on the [Releases page](https://github.com/extrant/Posegraph/releases)) and extract it somewhere with
+1. Download **[Posegraph-Backend-win64.zip](https://drive.google.com/file/d/1PnbqdyH0hOTMSPhBaSXQ-Dpjp3fil6k2/view?usp=sharing)** (Google Drive, about 4 GB) and extract it somewhere with
    enough space. An ASCII-only path is recommended.
 2. The folder contains `python`, `backend`, `LICENSES`, `Start-Backend.bat` and `README.txt`. Nothing needs to be installed.
 
@@ -106,10 +106,10 @@ Status bar icons, left to right: Brio, GPose, backend, VRAM, RAM; hover for deta
 
 | Skeleton group | Races | Status |
 |---|---|---|
-| Midlander-type ♂ | Midlander, Highlander, Miqo'te, Au Ra, Viera | Midlander verified in game; the others share the skeleton |
-| Elezen ♂ | Elezen | untested |
-| Roegadyn-type ♂ | Roegadyn, Hrothgar | untested |
-| Lalafell | Lalafell ♂ / ♀ | untested |
+| Midlander-type ♂ | Midlander, Highlander, Miqo'te, Au Ra, Viera | verified in game |
+| Elezen ♂ | Elezen | verified in game |
+| Roegadyn-type ♂ | Roegadyn, Hrothgar | fixed in 0.3.2, awaiting a retest in game |
+| Lalafell | Lalafell ♂ / ♀ | fixed in 0.3.2, awaiting a retest in game |
 | Female skeletons | all | **not supported yet** |
 
 If the detected race is wrong (race-changing mods, Customize+ scaling), choose it manually in the race list next to the actor list.

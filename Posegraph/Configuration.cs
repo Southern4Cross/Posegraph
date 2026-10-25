@@ -49,6 +49,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>松开滑杆时自动应用到角色（拖动中只更新预览）。</summary>
     public bool PushOnRelease { get; set; } = true;
 
+    /// <summary>进入 GPose 且 Brio 就绪时自动打开主界面。</summary>
+    public bool AutoOpenInGpose { get; set; } = true;
+
     /// <summary>新图识别完成后立即应用到角色。</summary>
     public bool PushAfterRecognize { get; set; }
 

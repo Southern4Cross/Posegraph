@@ -18,9 +18,22 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
     public Task<string?> GetPoseAsync(int? actor) => framework.RunOnFrameworkThread(() =>
         clientState.IsGPosing && Resolve(actor) is { } a ? brio.GetPose(a) : null);
 
-    /// <summary>角色的种族骨架编号（cXX01），读不到为 null。</summary>
-    public Task<string?> GetRaceAsync(int? actor) => framework.RunOnFrameworkThread(() =>
-        clientState.IsGPosing ? Races.FromCharacter(Resolve(actor)) : null);
+    /// <summary>
+    /// 角色"身份"：ObjectIndex + 当前加载的骨架编号 + 外貌数据。Glamourer 换种族 / 体型、GPose 目标换成另一个角色时都会变，
+    /// 界面据此丢弃缓存的参考姿势（骨长取自它，旧角色的骨长套到新种族上会把身体拉长或压扁）。
+    /// </summary>
+    public sealed record ActorIdentity(int Index, string Signature, string? Race);
+
+    /// <summary>必须在主线程调用。</summary>
+    public unsafe ActorIdentity? Identify(int? actor)
+    {
+        if (!clientState.IsGPosing || Resolve(actor) is not { } a) return null;
+        var race = Races.FromModel(a) ?? Races.FromCharacter(a);
+        var customize = a is ICharacter ch ? Convert.ToHexString(ch.Customize) : "";
+        return new ActorIdentity(a.ObjectIndex, $"{a.ObjectIndex}:{race}:{customize}", race);
+    }
+
+    public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));
 
     /// <summary>冻结动画、等几帧再导入（否则待机动画会让姿势漂移），之后再应用一次。返回错误信息，成功为 null。</summary>
     public async Task<string?> ApplyAsync(int? actor, string poseJson)

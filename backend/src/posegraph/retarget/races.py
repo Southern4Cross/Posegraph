@@ -32,11 +32,11 @@ def _r(code, name, male, group, validated=False):
 
 RACES: dict[str, RaceInfo] = {r.code: r for r in [
     _r("c0101", "人族中原 男", True, "中原系男", validated=True),
-    _r("c0301", "人族高地 男", True, "中原系男"),
-    _r("c0701", "猫魅 男", True, "中原系男"),
-    _r("c1301", "敖龙 男", True, "中原系男"),
-    _r("c1701", "维埃拉 男", True, "中原系男"),
-    _r("c0501", "精灵 男", True, "精灵男"),
+    _r("c0301", "人族高地 男", True, "中原系男", validated=True),
+    _r("c0701", "猫魅 男", True, "中原系男", validated=True),
+    _r("c1301", "敖龙 男", True, "中原系男", validated=True),
+    _r("c1701", "维埃拉 男", True, "中原系男", validated=True),
+    _r("c0501", "精灵 男", True, "精灵男", validated=True),
     _r("c0901", "鲁加 男", True, "鲁加系男"),
     _r("c1501", "硌狮 男", True, "鲁加系男"),
     _r("c1101", "拉拉菲尔 男", True, "拉拉菲尔"),

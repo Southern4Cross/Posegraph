@@ -281,7 +281,7 @@ def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
         code, source = requested, "plugin"
         # 骨长与识别出的种族明显不符：换种族/改体型 MOD、Customize+ 等
         if guessed and guessed[1] < 0.03 and races.RACES[guessed[0]].group != races.RACES[code].group:
-            warnings.append(tr("角色骨长更像{group}，可能装了改体型的 MOD，仍按{name}计算",
+            warnings.append(tr("游戏角色的骨长更像{group}，与所选{name}不符（刚换过种族？改体型 MOD？），身体比例会不对",
                                group=tr(races.RACES[guessed[0]].group), name=tr(races.RACES[code].name)))
     elif guessed and guessed[1] < 0.05:
         code, source = guessed[0], "guess"
@@ -294,8 +294,6 @@ def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
     info.update(name=tr(info["name"]), group=tr(info["group"]))
     if not info["supported"]:
         warnings.append(tr("{name}尚未适配（目前只适配男性骨架），姿势可能明显不对", name=info["name"]))
-    elif not info["validated"]:
-        warnings.append(tr("{name}尚未在游戏内实测，结果仅供参考", name=info["name"]))
     return {**info, "source": source, "warnings": warnings}
 
 

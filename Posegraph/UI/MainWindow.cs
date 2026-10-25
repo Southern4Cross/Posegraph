@@ -5,6 +5,7 @@ using Dalamud.Interface.Components;
 using Dalamud.Interface.DragDrop;
 using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Interface.Textures.TextureWraps;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
@@ -84,10 +85,11 @@ public sealed class MainWindow : Window, IDisposable
     private (int Index, string Name)[] _actors = [];
     private DateTime _lastActors = DateTime.MinValue;
     private string? _reference;
-    private int? _referenceActor = -1;
     private string? _detectedRace;      // 从角色外貌数据读出的骨架编号
     private string? _raceOverride;      // 手动指定，null 为自动
-    private readonly Dictionary<int, string> _backups = new();
+    private string? _referenceSignature;   // 缓存的参考姿势属于哪个角色身份（PoseApplier.ActorIdentity）
+    private string? _currentSignature;     // 当前角色身份，每秒刷新
+    private readonly Dictionary<string, string> _backups = new();   // 身份 → 第一次应用前的姿势
 
     // 3D 视图
     private float _yaw, _pitch = 0.15f, _zoom = 1f;
@@ -195,6 +197,25 @@ public sealed class MainWindow : Window, IDisposable
         _actors = _clientState.IsGPosing
             ? _brio.GetActors().Select(a => ((int)a.ObjectIndex, a.Name.TextValue)).ToArray()
             : [];
+
+        // 角色变了（Glamourer 换种族 / 体型、GPose 目标换人）：丢弃缓存的参考姿势与种族，重新计算
+        var id = _applier.Identify(_actor);
+        _currentSignature = id?.Signature;
+        if (id is null) return;
+        if (_reference is not null && _referenceSignature != id.Signature)
+        {
+            var raceChanged = id.Race != _detectedRace;
+            _reference = null;
+            _detectedRace = id.Race;
+            if (_session is not null)
+            {
+                RequestRetarget(false);
+                SetStatus(raceChanged ? Loc.F("检测到角色种族变化（{0}），已重新计算", Races.Label(id.Race))
+                                      : Loc.T("检测到角色外貌变化，已重新计算"), Yellow);
+            }
+        }
+        else if (_reference is null)
+            _detectedRace = id.Race;
     }
 
     private static void StatusIcon(FontAwesomeIcon icon, Vector4 color, string tip)
@@ -470,14 +491,16 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>游戏内角色当前姿势：骨长/缩放按游戏实际值（种族、Customize+）。每个角色取一次并留作还原备份。</summary>
     private async Task<string?> ReferenceAsync()
     {
-        if (_referenceActor == _actor && _reference is not null) return _reference;
+        // 每次都先确认角色身份：缓存只在同一个角色、同一套外貌下有效
+        var id = await _applier.IdentifyAsync(_actor);
+        if (id is null) return null;
+        _detectedRace = id.Race;
+        if (_reference is not null && _referenceSignature == id.Signature) return _reference;
         var pose = await _applier.GetPoseAsync(_actor);
         if (pose is null) return null;
-        _detectedRace = await _applier.GetRaceAsync(_actor);
         _reference = pose;
-        _referenceActor = _actor;
-        var key = _actor ?? -1;
-        _backups.TryAdd(key, pose);
+        _referenceSignature = id.Signature;
+        _backups.TryAdd(id.Signature, pose);
         return pose;
     }
 
@@ -501,7 +524,7 @@ public sealed class MainWindow : Window, IDisposable
 
     private void Restore()
     {
-        if (!_backups.TryGetValue(_actor ?? -1, out var backup)) return;
+        if (_currentSignature is null || !_backups.TryGetValue(_currentSignature, out var backup)) return;
         _ = Run(async () =>
         {
             var error = await _applier.ApplyAsync(_actor, backup);
@@ -611,8 +634,8 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
 
         // 角色
-        ImGui.SetNextItemWidth(Math.Min(150, ImGui.GetContentRegionAvail().X * 0.4f));
         var label = _actor is null ? Loc.T("GPose 目标") : _actors.FirstOrDefault(a => a.Index == _actor).Name ?? $"#{_actor}";
+        ImGui.SetNextItemWidth(ComboWidth(label, 140));
         if (ImGui.BeginCombo("##actor", label))
         {
             if (ImGui.Selectable(Loc.T("GPose 目标"), _actor is null)) SelectActor(null);
@@ -627,8 +650,9 @@ public sealed class MainWindow : Window, IDisposable
         var humans = _session?.Humans.Length ?? 0;
         using (ImRaii.Disabled(humans <= 1))
         {
-            ImGui.SetNextItemWidth(60);
-            if (ImGui.BeginCombo("##person", humans <= 1 ? Loc.T("1 人") : Loc.F("第 {0} 人", _person + 1)))
+            var personLabel = humans <= 1 ? Loc.T("1 人") : Loc.F("第 {0} 人", _person + 1);
+            ImGui.SetNextItemWidth(ComboWidth(personLabel, 70));
+            if (ImGui.BeginCombo("##person", personLabel))
             {
                 for (var i = 0; i < humans; i++)
                     if (ImGui.Selectable(Loc.F("第 {0} 人", i + 1), _person == i))
@@ -652,11 +676,21 @@ public sealed class MainWindow : Window, IDisposable
         }
     }
 
+    /// <summary>下拉框宽度：放得下当前文字（加箭头和内边距），不小于 min，也不超过剩余宽度。</summary>
+    private static float ComboWidth(string text, float min)
+    {
+        var style = ImGui.GetStyle();
+        var want = ImGui.CalcTextSize(text).X + ImGui.GetFrameHeight() + style.FramePadding.X * 2 + 4;
+        return Math.Min(Math.Max(min * ImGuiHelpers.GlobalScale, want), Math.Max(60, ImGui.GetContentRegionAvail().X));
+    }
+
     private void SelectActor(int? index)
     {
         _actor = index;
         _reference = null;
+        _referenceSignature = null;
         _detectedRace = null;
+        _lastActors = DateTime.MinValue;
         RequestRetarget(false);
     }
 
@@ -667,8 +701,9 @@ public sealed class MainWindow : Window, IDisposable
         var label = _raceOverride is not null ? Races.Label(_raceOverride)
             : used is not null ? used.Name : _detectedRace is not null ? Races.Label(_detectedRace) : Loc.T("种族");
         var warn = used is { Warnings.Length: > 0 };
-        ImGui.SetNextItemWidth(Math.Min(110, ImGui.GetContentRegionAvail().X * 0.3f));
-        if (ImGui.BeginCombo("##race", warn ? label + " (!)" : label))
+        var raceLabel = warn ? label + " (!)" : label;
+        ImGui.SetNextItemWidth(ComboWidth(raceLabel, 130));
+        if (ImGui.BeginCombo("##race", raceLabel))
         {
             if (ImGui.Selectable(Loc.F("自动（{0}）", (_detectedRace is null ? Loc.T("按骨长推断") : Races.Label(_detectedRace))), _raceOverride is null))
                 SelectRace(null);
@@ -680,7 +715,7 @@ public sealed class MainWindow : Window, IDisposable
                     ImGui.TextDisabled(Loc.T(r.Group));
                     group = r.Group;
                 }
-                if (ImGui.Selectable(Loc.F("  {0}{1}##{2}", Loc.T(r.Name), !r.Supported ? Loc.T("（未适配）") : r.Validated ? "" : Loc.T("（未实测）"), r.Code), _raceOverride == r.Code))
+                if (ImGui.Selectable(Loc.F("  {0}{1}##{2}", Loc.T(r.Name), !r.Supported ? Loc.T("（未适配）") : "", r.Code), _raceOverride == r.Code))
                     SelectRace(r.Code);
             }
             ImGui.EndCombo();
@@ -715,7 +750,7 @@ public sealed class MainWindow : Window, IDisposable
         if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing))
             ReplicateCamera();
         ImGui.SameLine();
-        if (IconButton("##restore", FontAwesomeIcon.Undo, Loc.T("还原为第一次应用前的姿势"), _backups.ContainsKey(_actor ?? -1) && _clientState.IsGPosing))
+        if (IconButton("##restore", FontAwesomeIcon.Undo, Loc.T("还原为第一次应用前的姿势"), _currentSignature is not null && _backups.ContainsKey(_currentSignature) && _clientState.IsGPosing))
             Restore();
         ImGui.SameLine();
         if (IconButton("##export", FontAwesomeIcon.Save, Loc.T("导出 Brio 姿势文件（.pose）"), hasResult))
@@ -1250,6 +1285,7 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.TextDisabled(Loc.T("操作"));
         changed |= Check(Loc.T("松开滑杆时自动应用到角色"), _config.PushOnRelease, v => _config.PushOnRelease = v);
         changed |= Check(Loc.T("识别完成后立即应用到角色"), _config.PushAfterRecognize, v => _config.PushAfterRecognize = v);
+        changed |= Check(Loc.T("进入 GPose 且 Brio 就绪时自动打开界面"), _config.AutoOpenInGpose, v => _config.AutoOpenInGpose = v);
 
         ImGui.Separator();
         ImGui.TextDisabled(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))));
