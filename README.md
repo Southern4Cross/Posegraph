@@ -47,7 +47,7 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 ### 1. Backend package
 
-1. Download **Posegraph-Backend-win64.zip** (link on the Releases page / project page) and extract it somewhere with
+1. Download **Posegraph-Backend-win64.zip** (link on the [Releases page](https://github.com/extrant/Posegraph/releases)) and extract it somewhere with
    enough space. An ASCII-only path is recommended.
 2. The folder contains `python`, `backend`, `LICENSES`, `Start-Backend.bat` and `README.txt`. Nothing needs to be installed.
 
@@ -55,7 +55,7 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 Posegraph is not in the official Dalamud repository. Until a custom repository is published:
 
-1. Download `Posegraph.zip` from the Releases page and extract it (or build it, see below).
+1. Download `Posegraph.zip` from the [Releases page](https://github.com/extrant/Posegraph/releases) and extract it (or build it, see below).
 2. In game: `/xlsettings` → *Experimental* → *Dev Plugin Locations*, add the path to `Posegraph.dll`, save,
    then enable Posegraph in the plugin installer (*Dev Tools*).
 
