@@ -150,7 +150,12 @@ powershell -ExecutionPolicy Bypass -File packaging\build_backend_package.ps1 `
 `GET /sessions/{id}/image`、`POST /sessions/{id}/retarget`、`POST /sessions/{id}/camera`、`POST /model/load|unload|config`、
 `GET /races`、`GET /presets`、`POST /shutdown`。两者都只监听本机。
 
-## 致谢与许可证
+## 许可证
+
+Posegraph 自身的代码（插件、后端、脚本）以 [PolyForm Noncommercial License 1.0.0](LICENSE) 授权：
+可以免费用于非商业用途，并修改、分享；不允许商业使用。第三方组件仍按各自的许可证。
+
+## 致谢
 
 见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。SAM 3D Body（代码与权重）© Meta，以 SAM License 发布；
 FF14 骨架数据提取自 Illusio Vitae Custom Skeletons。

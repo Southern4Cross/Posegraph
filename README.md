@@ -161,7 +161,13 @@ The backend (127.0.0.1:42430) exposes `GET /health`, `POST /sessions`, `GET /ses
 `POST /sessions/{id}/retarget`, `POST /sessions/{id}/camera`, `POST /model/load|unload|config`, `GET /races`, `GET /presets`,
 `POST /shutdown`. Both listen on localhost only.
 
-## Credits and licenses
+## License
+
+Posegraph's own code (plugin, backend, scripts) is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE): free to use, modify and share for noncommercial purposes;
+commercial use is not permitted. Third-party components keep their own licenses.
+
+## Credits
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). SAM 3D Body (code and weights) is © Meta and released under the SAM License;
 the FFXIV skeleton data is extracted from Illusio Vitae Custom Skeletons.
