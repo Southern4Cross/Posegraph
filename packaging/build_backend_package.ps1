@@ -12,7 +12,7 @@ Builds the one-click Posegraph backend package (portable Python + dependencies +
 -Venv    the virtualenv the backend runs in (its site-packages is copied: torch CUDA build, fastapi, ...)
 -Sam3d   clone of facebookresearch/sam-3d-body (scripts/setup_sam3d.ps1 creates it)
 -Weights folder with model.ckpt, model_config.yaml, assets/mhr_model.pt and LICENSE
-Result: <Out>\Posegraph-Backend\{python, backend, LICENSES, Start-Backend.bat, README.txt} (+ .zip / .7z with -Zip)
+Result: <Out>\Posegraph-Backend\{python, backend, LICENSES, runtime.json, Start-Backend.bat, README.txt} (+ .zip with -Zip)
 #>
 param(
     [Parameter(Mandatory)] [string] $Python,
@@ -20,6 +20,9 @@ param(
     [Parameter(Mandatory)] [string] $Sam3d,
     [Parameter(Mandatory)] [string] $Weights,
     [Parameter(Mandatory)] [string] $Out,
+    # Runtime version of this package (Python + dependencies). Bump it together with "runtime" in
+    # backend/src/posegraph/version.json whenever dependencies change; the plugin then asks users for the full package.
+    [int] $Runtime = 1,
     [switch] $Zip
 )
 $ErrorActionPreference = "Stop"
@@ -60,6 +63,12 @@ Copy-Item "$Weights\LICENSE" "$pkg\LICENSES\SAM-3D-Body-weights-LICENSE.txt"
 Copy-Item "$Sam3d\LICENSE" "$pkg\LICENSES\SAM-3D-Body-code-LICENSE.txt"
 Copy-Item "$Python\LICENSE.txt" "$pkg\LICENSES\Python-LICENSE.txt"
 Copy-Item "$PSScriptRoot\package\*" $pkg -Recurse
+$torch = & "$Venv\Scripts\python.exe" -c "import torch; print(torch.__version__)"
+$required = (Get-Content "$repo\backend\src\posegraph\version.json" -Raw | ConvertFrom-Json).runtime
+if ($required -gt $Runtime) { throw "backend/src/posegraph/version.json requires runtime $required, package is $Runtime" }
+@{ runtime = $Runtime; python = (& "$Python\python.exe" -c "import platform; print(platform.python_version())"); torch = "$torch" } |
+    ConvertTo-Json | Set-Content "$pkg\runtime.json" -Encoding ascii
+untime.json" -Encoding ascii
 if (Test-Path "$repo\LICENSE") { Copy-Item "$repo\LICENSE" "$pkg\LICENSES\Posegraph-LICENSE.txt" }
 Copy-Item "$repo\THIRD_PARTY_NOTICES.md" "$pkg\LICENSES\THIRD_PARTY_NOTICES.md"
 

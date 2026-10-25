@@ -42,6 +42,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>插件卸载 / 游戏退出时关闭由插件启动的后端。</summary>
     public bool StopBackendOnExit { get; set; } = true;
 
+    /// <summary>后端更新的下载加速前缀（加在 GitHub 地址前面，如 https://gh-proxy.org/），空为直连。</summary>
+    public string UpdateProxy { get; set; } = "";
+
     // ---- 操作习惯
     /// <summary>松开滑杆时自动应用到角色（拖动中只更新预览）。</summary>
     public bool PushOnRelease { get; set; } = true;

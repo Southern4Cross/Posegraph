@@ -35,13 +35,14 @@ from pydantic import BaseModel
 from . import tuning
 from .config import SERVICE_ROOT, settings
 from .estimators import create_estimator
+from . import RUNTIME_REQUIRED, __version__
 from .gpu import query_gpu
 from .i18n import set_language, tr
 from .retarget import races
 from .retarget.brio_pose import BrioPose
 from .retarget.ffxiv import load_mhr_rest, to_brio_pose_json
 
-app = FastAPI(title="posegraph", version="0.3.0")
+app = FastAPI(title="posegraph", version=__version__)
 _estimator = create_estimator()
 # 加载、推理、释放互斥（释放不能打断正在进行的识别）
 _model_lock = threading.RLock()
@@ -124,7 +125,7 @@ def _reason(r) -> str:
 @app.get("/health")
 def health() -> dict:
     # 显卡信息走 nvidia-smi：模型不在 GPU 上时不能为了查询去初始化 CUDA（会常驻几百 MB 显存）
-    return {"status": "ok", "version": app.version, "estimator": _estimator.name, "model": _model_info(),
+    return {"status": "ok", "version": app.version, "runtime": RUNTIME_REQUIRED, "estimator": _estimator.name, "model": _model_info(),
             "gpu": query_gpu(), "sessions": len(_sessions)}
 
 

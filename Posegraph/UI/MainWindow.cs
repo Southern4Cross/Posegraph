@@ -50,6 +50,13 @@ public sealed class MainWindow : Window, IDisposable
     private readonly BackendClient _client;
     private readonly BackendProcess _process;
     private readonly SystemProbe _probe = new();
+    private readonly BackendUpdater _updater = new();
+
+    // 后端版本信息（读磁盘，2 秒刷新一次）
+    private BackendUpdater.VersionInfo? _installedBackend;
+    private int? _packageRuntime;
+    private bool _backendOutdated;
+    private DateTime _lastVersionCheck = DateTime.MinValue;
     private readonly FileDialogManager _fileDialog = new();
 
     // 后端状态
@@ -132,6 +139,7 @@ public sealed class MainWindow : Window, IDisposable
             _process.Stop();
         _process.Dispose();
         _client.Dispose();
+        _updater.Dispose();
         _texture?.Dispose();
         _newTexture?.Dispose();
     }
@@ -150,9 +158,19 @@ public sealed class MainWindow : Window, IDisposable
 
     private bool ModelReady => _health?.Model.Loaded == true;
 
+    private void RefreshBackendVersion()
+    {
+        if (DateTime.UtcNow - _lastVersionCheck < TimeSpan.FromSeconds(2) || string.IsNullOrEmpty(_config.BackendDir)) return;
+        _lastVersionCheck = DateTime.UtcNow;
+        _installedBackend = BackendUpdater.Installed(_config.BackendDir);
+        _packageRuntime = BackendUpdater.PackageRuntime(_config.BackendDir);
+        _backendOutdated = _packageRuntime is not null && BackendUpdater.NeedsUpdate(_config.BackendDir);
+    }
+
     private void PollHealth()
     {
         _probe.Tick();
+        RefreshBackendVersion();
         if (_healthTask is { IsCompleted: false } || DateTime.UtcNow - _lastHealth < TimeSpan.FromSeconds(2)) return;
         _lastHealth = DateTime.UtcNow;
         _healthTask = Task.Run(async () =>
@@ -270,6 +288,8 @@ public sealed class MainWindow : Window, IDisposable
         if (_health is { } h)
         {
             if (h.Model.Error is { } err) return (FontAwesomeIcon.Server, Red, Loc.F("后端在线，模型加载失败：{0}", err));
+            if (_backendOutdated)
+                return (FontAwesomeIcon.Server, Yellow, Loc.F("后端在线 v{0}：有新版本 {1}，到设置页更新后端", h.Version, BackendUpdater.PluginTag));
             if (h.Model.Loading) return (FontAwesomeIcon.Server, Yellow, Loc.T("后端在线，模型加载中…"));
             var release = _config.ReleaseAfter switch { 0 => Loc.T("识别后立即释放"), < 0 => Loc.T("常驻"), var s => Loc.F("空闲 {0} 秒后释放", s) };
             return (FontAwesomeIcon.Server, Green, Loc.F("后端在线 v{0}\n", h.Version) + (h.Model.Loaded
@@ -288,6 +308,56 @@ public sealed class MainWindow : Window, IDisposable
         "auto" => Loc.T("自动"),
         _ => device ?? "",
     };
+
+    /// <summary>一键包用户：下载与插件同版本的后端源码替换 backend\src（见 BackendUpdater）。</summary>
+    private void UpdateBackend()
+    {
+        _ = Task.Run(async () =>
+        {
+            var error = await _updater.UpdateAsync(_config.BackendDir, _config.UpdateProxy, StopBackendAndWaitAsync, StartAndCheckAsync);
+            _lastVersionCheck = DateTime.MinValue;
+            if (error is null) SetStatus(Loc.F("后端已更新到 {0}", BackendUpdater.PluginTag), Green);
+            else SetError(error);
+        });
+    }
+
+    private async Task StopBackendAndWaitAsync()
+    {
+        if (_process.IsRunning) _process.Stop();
+        else
+        {
+            try { await _client.ShutdownAsync(); } catch { }
+        }
+        for (var i = 0; i < 20; i++)
+        {
+            try { await _client.HealthAsync(); }
+            catch { break; }
+            await Task.Delay(500);
+        }
+        _health = null;
+    }
+
+    /// <summary>启动后端并等它响应；version 非空时要求版本一致（确认运行的是新代码）。</summary>
+    private async Task<bool> StartAndCheckAsync(string version)
+    {
+        if (BackendProcess.Validate(_config) is not null) return false;
+        _process.Start(_config);
+        for (var i = 0; i < 120; i++)
+        {
+            await Task.Delay(1000);
+            try
+            {
+                if (await _client.HealthAsync() is { } h && (version.Length == 0 || h.Version == version))
+                {
+                    _health = h;
+                    return true;
+                }
+            }
+            catch { }
+            if (!_process.IsRunning) return false;
+        }
+        return false;
+    }
 
     private void StartBackend()
     {
@@ -1160,6 +1230,8 @@ public sealed class MainWindow : Window, IDisposable
         if (problem is null) ImGui.TextColored(Green, Loc.T("路径有效"));
         else ImGui.TextColored(Yellow, problem);
 
+        changed |= DrawUpdateSection();
+
         var port = _config.BackendPort;
         ImGui.SetNextItemWidth(100);
         if (ImGui.InputInt(Loc.T("后端端口"), ref port, 0)) { _config.BackendPort = Math.Clamp(port, 1024, 65535); changed = true; }
@@ -1201,6 +1273,41 @@ public sealed class MainWindow : Window, IDisposable
                 ImGui.TextUnformatted(line);
             if (ImGui.GetScrollY() >= ImGui.GetScrollMaxY()) ImGui.SetScrollHereY(1);
         }
+    }
+
+    /// <summary>设置页的后端更新区域。返回配置是否有改动。</summary>
+    private bool DrawUpdateSection()
+    {
+        var changed = false;
+        ImGui.Text(Loc.F("后端版本 {0}，插件 {1}", _installedBackend?.Version ?? Loc.T("未知"), BackendUpdater.PluginTag));
+        ImGui.SameLine();
+        if (_packageRuntime is null)
+            ImGui.TextDisabled(Loc.T("（源码安装：请用 git 更新到同版本）"));
+        else if (_updater.Busy)
+            ImGui.TextColored(Yellow, _updater.Status ?? Loc.T("更新中…"));
+        else if (_backendOutdated)
+        {
+            if (IconButton("##updateBackend", FontAwesomeIcon.CloudDownloadAlt,
+                           Loc.T("从 GitHub 下载同版本的后端源码（不到 1MB），只替换 backend\\src，Python、依赖和模型不动。会先停止后端，更新后自动启动")))
+                UpdateBackend();
+            ImGui.SameLine();
+            ImGui.TextColored(Yellow, Loc.F("可更新到 {0}", BackendUpdater.PluginTag));
+        }
+        else
+            ImGui.TextColored(Green, Loc.T("已是最新"));
+
+        if (_packageRuntime is not null)
+        {
+            var proxy = _config.UpdateProxy;
+            ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 140));
+            if (ImGui.InputText(Loc.T("下载加速前缀##proxy"), ref proxy, 256))
+            {
+                _config.UpdateProxy = proxy.Trim();
+                changed = true;
+            }
+            ItemTip(Loc.T("连不上 GitHub 时可以填加速前缀（如 https://gh-proxy.org/），会加在下载地址前面；留空为直连"));
+        }
+        return changed;
     }
 
     private static readonly (string Key, string Label, string Tip)[] Devices =
