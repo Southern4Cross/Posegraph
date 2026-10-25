@@ -47,11 +47,13 @@ Posegraph 插件（游戏内 ImGui）  ── HTTP（127.0.0.1）──►  Pose
 
 ### 2. 插件
 
-Posegraph 不在 Dalamud 官方仓库里。在自定义仓库发布之前：
+Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 
-1. 从[发布页](https://github.com/extrant/Posegraph/releases)下载 `Posegraph.zip` 并解压（或按下文自行编译）。
-2. 游戏里 `/xlsettings` → 实验性 → Dev Plugin Locations，添加 `Posegraph.dll` 的路径并保存，
-   再到插件管理器（开发工具）里启用 Posegraph。
+1. 游戏里 `/xlsettings` → 实验性 → 自定义插件仓库，添加
+   `https://raw.githubusercontent.com/extrant/DalamudPlugins/main/pluginmaster.json`，勾选并保存。
+2. 在插件管理器里搜索 **Posegraph** 并安装。
+
+也可以从[发布页](https://github.com/extrant/Posegraph/releases)下载 `Posegraph.zip` 解压，把 `Posegraph.dll` 添加到 Dev Plugin Locations。
 
 ### 3. 首次使用
 

@@ -54,11 +54,14 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 ### 2. Plugin
 
-Posegraph is not in the official Dalamud repository. Until a custom repository is published:
+Posegraph is not in the official Dalamud repository; install it from the custom repository:
 
-1. Download `Posegraph.zip` from the [Releases page](https://github.com/extrant/Posegraph/releases) and extract it (or build it, see below).
-2. In game: `/xlsettings` → *Experimental* → *Dev Plugin Locations*, add the path to `Posegraph.dll`, save,
-   then enable Posegraph in the plugin installer (*Dev Tools*).
+1. In game: `/xlsettings` → *Experimental* → *Custom Plugin Repositories*, add
+   `https://raw.githubusercontent.com/extrant/DalamudPlugins/main/pluginmaster.json`, tick it and save.
+2. Search for **Posegraph** in the plugin installer and install it.
+
+Alternatively, download `Posegraph.zip` from the [Releases page](https://github.com/extrant/Posegraph/releases), extract it
+and add `Posegraph.dll` under *Dev Plugin Locations*.
 
 ### 3. First start
 
