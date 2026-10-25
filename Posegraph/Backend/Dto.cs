@@ -58,7 +58,7 @@ public sealed record RaceUsed(string Code, string Name, string Group, bool Valid
 
 public sealed record RetargetResult(
     string Pose, PoseWarning[] Warnings, Dictionary<string, string> Severity,
-    JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race, bool ReferenceStale = false);
+    JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race);
 
 public sealed record CameraResult(float PositionErrorCm, float ForwardErrorDeg, float FovDeg, float TargetFovDeg,
                                   float FramingErrorPct, string[] Log);

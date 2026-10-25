@@ -475,11 +475,10 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
              offsets: dict[str, tuple[float, float, float]] | None = None,
              hand_strength: float = 1.0, hand_near: float = HAND_CONTACT_NEAR, hand_far: float = HAND_CONTACT_FAR,
              upright_max_deg: float = UPRIGHT_MAX_DEG, helper_strength: float = 1.0,
-             rest_vertices: np.ndarray | None = None, reference_lengths: bool = True) -> RetargetResult:
+             rest_vertices: np.ndarray | None = None) -> RetargetResult:
     """joint_global_rots: (127,3,3) SAM 3D Body 输出 pred_global_rots；
     joint_coords_cam: (127,3) pred_joint_coords（相机系，仅用于自检）；
     rest_coords / rest_rots: 该人物体型下的零姿态（缺省用平均体型 mhr_rest.json，骨段方向会有几度系统误差）；
-    reference_lengths: 骨长是否取 reference（False 时用该骨架的绑定骨长，缩放仍取 reference）；
     reference: 游戏内角色当前姿势（Posegraph GET /pose）。提供时骨长与缩放取游戏实际值——
     Brio IPC 导入会覆盖位置和缩放，不按实际值写会改变其他种族 / Customize+ 角色的体型；
     compensate_hands: 末端补偿。两套骨架比例不同（如 TBSE-X 肩更低更窄），只复制角度时手相对头/躯干会错位，
@@ -498,7 +497,7 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
     rest_vertices: 该人物零姿态网格顶点（MHR 模型系），给出时手部末端补偿按头 / 胸 / 髋实际尺寸换算接触位置；
     ground: 自动贴地。n_hara 的高度固定在站立高度，倒立/跪坐/躺下时角色会悬空，
     开启后把最低的关节平移到绑定姿势中最低关节的高度（跳跃照片也会被按到地面上）。"""
-    sk = _with_reference_lengths(load_ffxiv_skeleton(race), reference if reference_lengths else None)
+    sk = _with_reference_lengths(load_ffxiv_skeleton(race), reference)
     mhr_names, mean_pos, mean_rot = load_mhr_rest()
     mhr_rest_pos = mean_pos if rest_coords is None else rest_coords
     mhr_rest_rot = mean_rot if rest_rots is None else R.from_matrix(rest_rots)

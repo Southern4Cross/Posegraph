@@ -271,25 +271,6 @@ class RetargetRequest(BaseModel):
     overlay: bool = True
     stick: bool = True
     race: str | None = None         # 骨架编号 cXXXX（插件按角色外貌数据识别）；缺省时按 reference 的骨长推断
-    trust_reference: bool = False   # 插件已清除过 Brio 姿势栈：骨长不符也按游戏实际值（Customize+、改体型 MOD）
-
-
-def _reference_lengths(ref: BrioPose | None, race: dict, trust: bool) -> tuple[bool, bool]:
-    """返回 (骨长是否取游戏值, 游戏骨长是否像残留的旧姿势)，并把提示加到 race["warnings"]。
-    换种族后 Brio 会把按旧骨架算的位置增量继续叠加在新骨架上，读回的骨长是错的，而且重新应用也恢复不了
-    （读回的是上次自己写进去的错误骨长）。"""
-    if ref is None:
-        return True, False
-    dev = races.length_deviation(ref, race["code"])
-    if dev is None or dev <= races.STALE_DEVIATION:
-        return True, False
-    if trust:
-        race["warnings"].append(tr("游戏骨长与{name}相差 {pct}%（Customize+ 或改体型 MOD？），按游戏实际骨长计算",
-                                   name=race["name"], pct=round(dev * 100)))
-        return True, True
-    race["warnings"].append(tr("游戏骨长与{name}相差 {pct}%，多半是换种族前残留的 Brio 姿势，已改用{name}的标准骨长",
-                               name=race["name"], pct=round(dev * 100)))
-    return False, True
 
 
 def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
@@ -329,11 +310,10 @@ def session_retarget(sid: str, req: RetargetRequest) -> dict:
     t0 = time.perf_counter()
     ref = BrioPose.loads(req.reference) if req.reference else None
     race = _resolve_race(req.race, ref)
-    use_lengths, stale = _reference_lengths(ref, race, req.trust_reference)
-    rt = tuning.run(human, s.image_size, req.params, ref, race["code"], reference_lengths=use_lengths)
+    rt = tuning.run(human, s.image_size, req.params, ref, race["code"])
     warnings, severity = tuning.check(rt, race["code"])
     out = {"pose": to_brio_pose_json(rt), "warnings": warnings, "severity": severity,
-           "compensation": rt.hand_compensation, "race": race, "referenceStale": stale}
+           "compensation": rt.hand_compensation, "race": race}
     if req.overlay:
         out["overlay"] = tuning.overlay(human, s.image_size, rt, race["code"])
     if req.stick:
@@ -360,9 +340,7 @@ def session_camera(sid: str, req: CameraRequest) -> dict:
     client = BridgeClient()
     pose_json = client.get_pose(req.actor)
     ref = BrioPose.loads(pose_json)
-    race = _resolve_race(req.race, ref)
-    rt = tuning.run(human, s.image_size, req.params, ref, race["code"],
-                    reference_lengths=_reference_lengths(ref, race, False)[0])
+    rt = tuning.run(human, s.image_size, req.params, ref, _resolve_race(req.race, ref)["code"])
     model = ref.raw["ModelAbsoluteValues"]
     vec = lambda v: np.array([float(x) for x in v.split(",")])
     target = photo_camera_in_world(human, rt, vec(model["Position"]), vec(model["Rotation"]), vec(model["Scale"]),
