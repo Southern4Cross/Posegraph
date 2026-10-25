@@ -1,0 +1,169 @@
+# Posegraph
+
+**English** | [简体中文](README.zh-CN.md)
+
+Turn a photo or an illustration into a pose for your FINAL FANTASY XIV character.
+
+Posegraph is a Dalamud plugin with a local AI backend. Pick an image in game, and the backend recognizes the
+3D body pose with Meta's [SAM 3D Body](https://github.com/facebookresearch/sam-3d-body), retargets it onto the
+FFXIV skeleton of your race, and the plugin applies it to your GPose actor through [Brio](https://github.com/Etheirys/Brio).
+
+```
+Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph backend (local Python)
+  status, image picker, overlays,                            SAM 3D Body recognition (once per image)
+  3D preview, tuning sliders,                                MHR → FFXIV retargeting (~50 ms per change)
+  apply / camera / export          ◄── Brio pose JSON ───   race skeletons, plausibility checks
+        │
+        └── Brio IPC: freeze actor, load pose
+```
+
+## Features
+
+- **Photo and illustration support**, full or half body, fingers included. An *Illustration* preset tones down
+  the exaggerated head/neck proportions of drawn art.
+- **All playable races.** The race is read from the character's appearance (or chosen manually); 18 IVCS
+  skeletons are included. Midlander ♂ is verified in game; the others are marked *untested* in the UI.
+- **Live tuning without re-running the AI**: per-region amplitude (spine, neck, head, clavicle, wrist), hand contact
+  compensation, gravity correction, ground snapping, helper-bone strength, and manual per-joint offsets in a 3D stick figure.
+  Dragging a slider updates the preview; releasing it applies the pose (Brio's undo history stays clean).
+- **Plausibility hints** with one-click fixes, based on ranges sampled from in-game animations.
+- **Hand contact compensation**: hands touching the head / chest / hips stay in contact even when your race's
+  proportions differ from the person in the photo; elbows stay pure hinges.
+- **Camera matching**: reproduces the photo's camera angle, distance and field of view in GPose.
+- **Export** Brio `.pose` files.
+- **Low-VRAM friendly**: Auto / GPU / CPU modes, the model is unloaded right after each recognition by default,
+  and CPU mode uses no VRAM at all.
+- **English and Simplified Chinese UI**, following the game client language by default.
+
+## Requirements
+
+- FINAL FANTASY XIV with Dalamud (API 15) and **Brio** installed and enabled
+- Windows 10/11 64-bit
+- For GPU inference: an NVIDIA GPU with about **3 GB free VRAM** (about 2 GB used while recognizing).
+  Without it, Posegraph runs on the CPU: about 10–20 s per image and about 4 GB RAM.
+- About 7 GB of disk space for the backend package
+
+## Installation
+
+### 1. Backend package
+
+1. Download **Posegraph-Backend-win64.zip** (link on the Releases page / project page) and extract it somewhere with
+   enough space. An ASCII-only path is recommended.
+2. The folder contains `python`, `backend`, `LICENSES`, `Start-Backend.bat` and `README.txt`. Nothing needs to be installed.
+
+### 2. Plugin
+
+Posegraph is not in the official Dalamud repository. Until a custom repository is published:
+
+1. Download `Posegraph.zip` from the Releases page and extract it (or build it, see below).
+2. In game: `/xlsettings` → *Experimental* → *Dev Plugin Locations*, add the path to `Posegraph.dll`, save,
+   then enable Posegraph in the plugin installer (*Dev Tools*).
+
+### 3. First start
+
+1. `/posegraph` opens the main window.
+2. *Settings* → **Choose backend package folder…** → select the extracted folder.
+3. Click the **plug** icon in the status bar to start the backend. Optionally enable *Start the backend when the plugin loads*.
+
+## Usage
+
+1. Enter GPose and select the actor (or pick one in the actor list).
+2. Click the folder icon or drag an image onto the *Image* tab (jpg, png, webp, bmp, gif first frame, tiff, avif).
+3. The first recognition loads the model (about 10–20 s); after that a recognition takes a few seconds.
+4. Check the overlay (*Image* tab: green = detected skeleton, orange = FFXIV skeleton) and the *3D* tab.
+5. Tune on the *Tuning* tab, read the *Hints* tab, then **Apply** (▶). Use the camera button to match the photo camera,
+   ↶ to restore the pose from before the first apply, and the disk button to export a `.pose` file.
+
+Status bar icons, left to right: Brio, GPose, backend, VRAM, RAM; hover for details.
+
+### Settings
+
+| Setting | Default | Notes |
+|---|---|---|
+| Language | Auto | Chinese if the game client is Chinese, otherwise the Dalamud UI language decides; English if neither is Chinese |
+| Device | Auto | GPU when ~3 GB VRAM is free, otherwise CPU. *GPU* forces the GPU, *CPU* never touches VRAM |
+| Unload model | Right after recognition | Frees VRAM/RAM for the game; the next recognition reloads the model (~5–10 s) |
+| Keep MHR on the CPU | On | Saves ~750 MB VRAM in GPU mode, ~0.5 s slower |
+| Apply when a slider is released | On | Turn off to apply manually |
+
+### Races
+
+| Skeleton group | Races | Status |
+|---|---|---|
+| Midlander-type ♂ | Midlander, Highlander, Miqo'te, Au Ra, Viera | Midlander verified in game; the others share the skeleton |
+| Elezen ♂ | Elezen | untested |
+| Roegadyn-type ♂ | Roegadyn, Hrothgar | untested |
+| Lalafell | Lalafell ♂ / ♀ | untested |
+| Female skeletons | all | untested |
+
+If the detected race is wrong (race-changing mods, Customize+ scaling), choose it manually in the race list next to the actor list.
+
+## Known limitations
+
+- Single-image depth is ambiguous (e.g. a hand in front of or behind the head).
+- No collision avoidance yet: Lalafell's raised arms can pass through the head, and Roegadyn/Hrothgar thighs can
+  sink into the belly in high-knee poses.
+- Very strong elbow flexion creases more than in-game animations (~145° vs ~130°).
+- Jumping / airborne images are pulled to the ground unless *Snap to ground* is turned off.
+- Multiple people and video are reserved in the UI but not implemented; the whole image is treated as one person.
+- The CPU mode speed depends heavily on the CPU (measured ~10 s per image on a 20-thread laptop CPU).
+
+## Building from source
+
+### Plugin
+
+```powershell
+cd Posegraph
+dotnet build -c Release      # output: Posegraph\bin\Release\Posegraph\latest.zip
+```
+
+The project uses `Dalamud.NET.SDK` 15 and `Brio.API`. For XIVLauncherCN the Dalamud path is picked up automatically.
+
+### Backend (development install)
+
+```powershell
+cd backend
+powershell -ExecutionPolicy Bypass -File scripts\setup_sam3d.ps1     # venv, CUDA PyTorch, upstream source, weights (SHA256-checked)
+.venv\Scripts\python -m posegraph.app                               # http://127.0.0.1:42430
+```
+
+Weights come from ModelScope by default (no login); `-Source hf` uses the official gated Hugging Face repository.
+Environment variables (prefix `POSEGRAPH_`): `DEVICE` (auto|cuda|cpu), `PRECISION` (auto|bf16|fp16|fp32), `MHR_ON_CPU`,
+`MIN_FREE_VRAM_MB`, `RELEASE_AFTER` (seconds, 0 = right away, -1 = keep), `PRELOAD`, `SAVE_SESSIONS` (save each recognition as an npz under `outputs/ui`), `PORT`, `BRIDGE_URL`, `SAM3D_REPO`, `SAM3D_CKPT`.
+
+### Backend package
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_backend_package.ps1 `
+    -Python C:\Path\To\Python311 -Venv backend\.venv `
+    -Sam3d backend\third_party\sam-3d-body -Weights backend\checkpoints\sam-3d-body-vith `
+    -Out D:\dist -Zip
+```
+
+It copies a regular CPython 3.11 install as a portable interpreter, the venv's site-packages, the backend source,
+the SAM 3D Body source and weights, and the license files.
+
+### Developer tools (`backend/scripts`, Chinese output)
+
+| Script | Purpose |
+|---|---|
+| `photo_to_game.py`, `image_to_pose.py`, `push_pose.py`, `preview_overlay.py` | Command-line pipeline without the plugin UI |
+| `verify_devices.py`, `bench_sam3d.py` | Compare CPU/GPU outputs, measure VRAM and speed (see `docs/benchmark.md`) |
+| `build_retarget_data.py` | Regenerate skeleton data from IVCS `.sklb` files |
+| `sample_frames.py` | Sample in-game animation frames (used to fit helper-bone rules) |
+| `export_race_compare.py`, `blender_race_compare.py`, `build_body_extents.py` | Multi-race comparison scenes in Blender and body-size tables |
+
+## HTTP interfaces
+
+The plugin also runs a small local server (127.0.0.1:42429) used by the backend for camera matching and by the
+command-line tools: `GET /status`, `GET /actors`, `GET|POST /pose?actor=N`, `GET|POST /camera`.
+The backend (127.0.0.1:42430) exposes `GET /health`, `POST /sessions`, `GET /sessions/{id}/image`,
+`POST /sessions/{id}/retarget`, `POST /sessions/{id}/camera`, `POST /model/load|unload|config`, `GET /races`, `GET /presets`,
+`POST /shutdown`. Both listen on localhost only.
+
+## Credits and licenses
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). SAM 3D Body (code and weights) is © Meta and released under the SAM License;
+the FFXIV skeleton data is extracted from Illusio Vitae Custom Skeletons.
+
+FINAL FANTASY XIV © SQUARE ENIX CO., LTD. Posegraph is a fan-made tool, not affiliated with or endorsed by Square Enix.

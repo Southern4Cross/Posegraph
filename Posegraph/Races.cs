@@ -1,0 +1,61 @@
+using Dalamud.Game.ClientState.Objects.Enums;
+using Dalamud.Game.ClientState.Objects.Types;
+
+namespace Posegraph;
+
+/// <summary>
+/// 种族骨架编号 cXX01（与后端 posegraph/retarget/races.py 一致）。XX：中原男 01 / 女 02、高地 03/04、精灵 05/06、猫魅 07/08、
+/// 鲁加 09/10、拉拉菲尔 11/12、敖龙 13/14、硌狮 15/16、维埃拉 17/18。
+/// </summary>
+public static class Races
+{
+    public sealed record Race(string Code, string Name, string Group, bool Validated);
+
+    public static readonly Race[] All =
+    [
+        new("c0101", "人族中原 男", "中原系男", true),
+        new("c0301", "人族高地 男", "中原系男", false),
+        new("c0701", "猫魅 男", "中原系男", false),
+        new("c1301", "敖龙 男", "中原系男", false),
+        new("c1701", "维埃拉 男", "中原系男", false),
+        new("c0501", "精灵 男", "精灵男", false),
+        new("c0901", "鲁加 男", "鲁加系男", false),
+        new("c1501", "硌狮 男", "鲁加系男", false),
+        new("c1101", "拉拉菲尔 男", "拉拉菲尔", false),
+        new("c0201", "人族中原 女", "中原系女", false),
+        new("c0401", "人族高地 女", "中原系女", false),
+        new("c1801", "维埃拉 女", "中原系女", false),
+        new("c0601", "精灵 女", "精灵系女", false),
+        new("c1001", "鲁加 女", "精灵系女", false),
+        new("c1601", "硌狮 女", "精灵系女", false),
+        new("c0801", "猫魅 女", "猫魅系女", false),
+        new("c1401", "敖龙 女", "猫魅系女", false),
+        new("c1201", "拉拉菲尔 女", "拉拉菲尔", false),
+    ];
+
+    public static Race? Find(string? code) => All.FirstOrDefault(r => r.Code == code);
+
+    public static string Label(string? code) => Find(code) is { } r ? Loc.T(r.Name) : code ?? Loc.T("未知");
+
+    /// <summary>按角色外貌数据（种族、部族、性别）得到骨架编号；非人形模型（坐骑、怪物等）返回 null。必须在主线程调用。</summary>
+    public static string? FromCharacter(IGameObject? obj)
+    {
+        if (obj is not ICharacter ch) return null;
+        var c = ch.Customize;
+        if (c.Length <= (int)CustomizeIndex.Tribe) return null;
+        int baseId = c[(int)CustomizeIndex.Race] switch
+        {
+            1 => c[(int)CustomizeIndex.Tribe] == 2 ? 3 : 1,   // 人族：部族 1 中原、2 高地
+            2 => 5,
+            3 => 11,
+            4 => 7,
+            5 => 9,
+            6 => 13,
+            7 => 15,
+            8 => 17,
+            _ => 0,
+        };
+        if (baseId == 0) return null;
+        return $"c{baseId + c[(int)CustomizeIndex.Gender]:00}01";
+    }
+}

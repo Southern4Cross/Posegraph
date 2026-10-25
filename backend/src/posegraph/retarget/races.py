@@ -1,0 +1,94 @@
+"""种族骨架：模型编号 cXX01（XX 为种族/部族与性别，男为奇数、女为偶数，见 RACES）、显示名、验证状态，以及按骨长推断种族。
+
+IVCS 2.2 的 18 套骨架骨骼名与父子结构完全相同，区别只在绑定姿势（骨长、朝向）。我们用到的骨骼按绑定姿势只有 7 种：
+男：中原系（中原 / 高地 / 猫魅 / 敖龙 / 维埃拉，只有耳朵挂点不同）、精灵、鲁加系（鲁加 / 硌狮）；
+女：中原系（中原 / 高地 / 维埃拉）、精灵系（精灵 / 鲁加 / 硌狮）、猫魅系（猫魅 / 敖龙）；拉拉菲尔男女相同。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class RaceInfo:
+    code: str
+    name: str
+    male: bool
+    group: str          # 绑定姿势相同（只差耳朵等不写入的骨骼）的骨架归为一组
+    validated: bool     # 游戏内实测过
+
+
+def _r(code, name, male, group, validated=False):
+    return RaceInfo(code, name, male, group, validated)
+
+
+RACES: dict[str, RaceInfo] = {r.code: r for r in [
+    _r("c0101", "人族中原 男", True, "中原系男", validated=True),
+    _r("c0301", "人族高地 男", True, "中原系男"),
+    _r("c0701", "猫魅 男", True, "中原系男"),
+    _r("c1301", "敖龙 男", True, "中原系男"),
+    _r("c1701", "维埃拉 男", True, "中原系男"),
+    _r("c0501", "精灵 男", True, "精灵男"),
+    _r("c0901", "鲁加 男", True, "鲁加系男"),
+    _r("c1501", "硌狮 男", True, "鲁加系男"),
+    _r("c1101", "拉拉菲尔 男", True, "拉拉菲尔"),
+    _r("c0201", "人族中原 女", False, "中原系女"),
+    _r("c0401", "人族高地 女", False, "中原系女"),
+    _r("c1801", "维埃拉 女", False, "中原系女"),
+    _r("c0601", "精灵 女", False, "精灵系女"),
+    _r("c1001", "鲁加 女", False, "精灵系女"),
+    _r("c1601", "硌狮 女", False, "精灵系女"),
+    _r("c0801", "猫魅 女", False, "猫魅系女"),
+    _r("c1401", "敖龙 女", False, "猫魅系女"),
+    _r("c1201", "拉拉菲尔 女", False, "拉拉菲尔"),
+]}
+
+DEFAULT_RACE = "c0101"
+
+# 推断用的骨段：大腿+小腿+脚踝、上臂+前臂、肩宽、髋→颈
+_SEGMENTS = {
+    "leg": [("j_asi_a_l", "j_asi_b_l"), ("j_asi_b_l", "j_asi_c_l"), ("j_asi_c_l", "j_asi_d_l")],
+    "arm": [("j_ude_a_l", "j_ude_b_l"), ("j_ude_b_l", "j_te_l")],
+    "shoulder": [("j_ude_a_l", "j_ude_a_r")],
+    "torso": [("j_asi_a_l", "j_kubi")],
+}
+
+
+def _lengths(pos) -> np.ndarray:
+    """pos：骨骼名 → 模型空间位置。"""
+    return np.array([sum(np.linalg.norm(np.asarray(pos(a)) - np.asarray(pos(b))) for a, b in segs)
+                     for segs in _SEGMENTS.values()])
+
+
+def guess_race(reference) -> tuple[str, float]:
+    """按游戏内角色的骨长（BrioPose）找最接近的骨架，返回 (编号, 相对误差)。
+    用比例而非绝对长度：身高滑条、Customize+ 等会整体缩放。相同骨架的种族返回组内第一个。"""
+    from .ffxiv import forward_kinematics, load_ffxiv_skeleton
+
+    try:
+        ref = _lengths(lambda n: reference.get(n).position)
+    except AttributeError:   # 缺骨骼
+        return DEFAULT_RACE, float("inf")
+    ref = ref / ref[0]
+    best, best_err, seen = DEFAULT_RACE, float("inf"), set()
+    for code, info in RACES.items():
+        if info.group in seen:
+            continue
+        seen.add(info.group)
+        sk = load_ffxiv_skeleton(code)
+        _, P = forward_kinematics(sk)
+        lengths = _lengths(lambda n: P[sk.index(n)])
+        err = float(np.abs(np.log(ref / (lengths / lengths[0]))).max())
+        if err < best_err:
+            best, best_err = code, err
+    return best, best_err
+
+
+def describe(code: str) -> dict:
+    info = RACES.get(code)
+    if info is None:
+        return {"code": code, "name": code, "group": "", "validated": False, "known": False}
+    return {"code": code, "name": info.name, "group": info.group, "validated": info.validated, "known": True}

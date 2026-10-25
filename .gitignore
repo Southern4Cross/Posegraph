@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Backend: upstream source, model weights, outputs
+backend/third_party/
+backend/checkpoints/
+backend/outputs/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+
+# Packaging output
+dist/
+*.zip
+*.7z

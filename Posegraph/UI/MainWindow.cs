@@ -1,0 +1,1258 @@
+using System.Numerics;
+using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
+using Dalamud.Interface.Components;
+using Dalamud.Interface.DragDrop;
+using Dalamud.Interface.ImGuiFileDialog;
+using Dalamud.Interface.Textures.TextureWraps;
+using Dalamud.Interface.Utility.Raii;
+using Dalamud.Interface.Windowing;
+using Dalamud.Plugin;
+using Dalamud.Plugin.Services;
+using Posegraph.Backend;
+
+namespace Posegraph.UI;
+
+/// <summary>
+/// 主界面：状态栏 → 选图识别 → 图像叠加 / 3D 火柴人 / 调整 / 提示 / 设置 → 应用、镜头、还原、导出。
+/// 识别只做一次（后端缓存），调参只重跑重定向；拖动滑杆时只刷新预览，松手才应用到角色（Brio 撤销历史保持干净）。
+/// </summary>
+public sealed class MainWindow : Window, IDisposable
+{
+    private static readonly Vector4 Green = new(0.35f, 0.85f, 0.4f, 1);
+    private static readonly Vector4 Yellow = new(1f, 0.8f, 0.25f, 1);
+    private static readonly Vector4 Red = new(1f, 0.35f, 0.3f, 1);
+    private static readonly Vector4 Grey = new(0.6f, 0.6f, 0.6f, 1);
+    private static readonly Vector4 Orange = new(1f, 0.55f, 0f, 1);
+    private static readonly Vector4 MhrGreen = new(0.31f, 0.86f, 0.31f, 1);
+
+    private const string ImageExtensions = "{.jpg,.jpeg,.png,.webp,.bmp,.gif,.tif,.tiff,.avif}";
+
+    // 静态表里的界面文字存中文原文，使用时再 Loc.T 翻译（运行时可切换语言）
+
+    private static readonly (string Key, string Label, string Tip)[] AmplitudeGroups =
+    [
+        ("spine", "脊柱", "腰/背/胸三节的弯曲扭转。脊柱用绑定朝向对齐后动作可能偏保守，可适当放大"),
+        ("neck", "颈", "颈部转动。插画头颈比例夸张，识别容易估大，建议 0.7"),
+        ("head", "头", "头部相对颈的转动。插画建议 0.7"),
+        ("clavicle", "锁骨", "耸肩/含胸。过大时斜方肌会隆起、肩部出尖角"),
+        ("wrist", "手腕", "手腕弯曲扭转"),
+    ];
+
+    private readonly Configuration _config;
+    private readonly IDalamudPluginInterface _pi;
+    private readonly IClientState _clientState;
+    private readonly ITextureProvider _textures;
+    private readonly IDragDropManager _dragDrop;
+    private readonly BrioBridge _brio;
+    private readonly PoseApplier _applier;
+    private readonly BridgeServer _server;
+    private readonly BackendClient _client;
+    private readonly BackendProcess _process;
+    private readonly SystemProbe _probe = new();
+    private readonly FileDialogManager _fileDialog = new();
+
+    // 后端状态
+    private Health? _health;
+    private string? _healthError;
+    private DateTime _lastHealth = DateTime.MinValue;
+    private Task? _healthTask;
+
+    // 会话
+    private SessionInfo? _session;
+    private string? _imagePath;
+    private IDalamudTextureWrap? _texture;
+    private IDalamudTextureWrap? _newTexture;
+    private int _person;
+    private RetargetParams _params;
+    private string _preset;
+    private volatile RetargetResult? _result;
+    private volatile bool _recognizing;
+
+    // 重定向请求合并：忙时只记"还需要再算一次"
+    private volatile bool _rtBusy, _rtDirty, _rtPush;
+
+    // 角色
+    private int? _actor;
+    private (int Index, string Name)[] _actors = [];
+    private DateTime _lastActors = DateTime.MinValue;
+    private string? _reference;
+    private int? _referenceActor = -1;
+    private string? _detectedRace;      // 从角色外貌数据读出的骨架编号
+    private string? _raceOverride;      // 手动指定，null 为自动
+    private readonly Dictionary<int, string> _backups = new();
+
+    // 3D 视图
+    private float _yaw, _pitch = 0.15f, _zoom = 1f;
+    private bool _dragged;
+    private string? _selected;
+
+    private string _statusText = Loc.T("就绪");
+    private Vector4 _statusColor = Grey;
+    private int? _selectTab;
+
+    public MainWindow(Configuration config, IDalamudPluginInterface pi, IClientState clientState, ITextureProvider textures,
+                      IDragDropManager dragDrop, BrioBridge brio, PoseApplier applier, BridgeServer server)
+        : base("Posegraph###PosegraphMain")
+    {
+        _config = config;
+        _pi = pi;
+        _clientState = clientState;
+        _textures = textures;
+        _dragDrop = dragDrop;
+        _brio = brio;
+        _applier = applier;
+        _server = server;
+        _client = new BackendClient(() => _config.BackendPort);
+        _process = new BackendProcess();
+        _preset = config.DefaultPreset;
+        _params = RetargetParams.Preset(_preset);
+
+        Size = new Vector2(420, 560);
+        SizeCondition = ImGuiCond.FirstUseEver;
+        SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(330, 260), MaximumSize = new Vector2(4000, 4000) };
+
+        if (_config.AutoStartBackend && BackendProcess.Validate(_config) is null)
+            _ = Task.Run(async () =>
+            {
+                try { await _client.HealthAsync(); }   // 已有后端在跑（比如手动启动的）就不再启动
+                catch { _process.Start(_config); }
+            });
+    }
+
+    public void OpenSettings()
+    {
+        IsOpen = true;
+        _selectTab = 4;
+    }
+
+    public void Dispose()
+    {
+        if (_config.StopBackendOnExit)
+            _process.Stop();
+        _process.Dispose();
+        _client.Dispose();
+        _texture?.Dispose();
+        _newTexture?.Dispose();
+    }
+
+    private void SetStatus(string text, Vector4? color = null)
+    {
+        _statusText = text;
+        _statusColor = color ?? Grey;
+    }
+
+    private void SetError(string text) => SetStatus(text, Red);
+
+    // ------------------------------------------------------------------ 状态
+
+    private bool BackendOnline => _health is not null;
+
+    private bool ModelReady => _health?.Model.Loaded == true;
+
+    private void PollHealth()
+    {
+        _probe.Tick();
+        if (_healthTask is { IsCompleted: false } || DateTime.UtcNow - _lastHealth < TimeSpan.FromSeconds(2)) return;
+        _lastHealth = DateTime.UtcNow;
+        _healthTask = Task.Run(async () =>
+        {
+            try
+            {
+                _health = await _client.HealthAsync();
+                _healthError = null;
+            }
+            catch (Exception ex)
+            {
+                _health = null;
+                _healthError = ex.Message;
+            }
+        });
+    }
+
+    private void RefreshActors()
+    {
+        if (DateTime.UtcNow - _lastActors < TimeSpan.FromSeconds(1)) return;
+        _lastActors = DateTime.UtcNow;
+        _actors = _clientState.IsGPosing
+            ? _brio.GetActors().Select(a => ((int)a.ObjectIndex, a.Name.TextValue)).ToArray()
+            : [];
+    }
+
+    private static void StatusIcon(FontAwesomeIcon icon, Vector4 color, string tip)
+    {
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+            ImGui.TextColored(color, icon.ToIconString());
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(tip);
+        ImGui.SameLine();
+    }
+
+    private static bool IconButton(string id, FontAwesomeIcon icon, string tip, bool enabled = true)
+    {
+        bool clicked;
+        using (ImRaii.Disabled(!enabled))
+            clicked = ImGuiComponents.IconButton(id, icon);
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) ImGui.SetTooltip(tip);
+        return clicked && enabled;
+    }
+
+    private void DrawStatusBar()
+    {
+        // Brio
+        var brio = _pi.InstalledPlugins.FirstOrDefault(p => p.InternalName == "Brio");
+        var brioIpc = brio is { IsLoaded: true } && _brio.IsAvailable();
+        if (brio is null) StatusIcon(FontAwesomeIcon.TimesCircle, Red, Loc.T("Brio：未安装"));
+        else if (!brio.IsLoaded) StatusIcon(FontAwesomeIcon.PauseCircle, Yellow, Loc.F("Brio {0}：已安装但未启用", brio.Version));
+        else StatusIcon(FontAwesomeIcon.CheckCircle, brioIpc ? Green : Yellow,
+                        brioIpc ? Loc.F("Brio {0}：可用", brio.Version) : Loc.F("Brio {0}：已启用，IPC 暂不可用", brio.Version));
+
+        // GPose
+        StatusIcon(FontAwesomeIcon.Camera, _clientState.IsGPosing ? Green : Grey,
+                   _clientState.IsGPosing ? Loc.T("GPose：已进入") : Loc.T("GPose：未进入（只能预览和导出，不能应用到角色）"));
+
+        // 后端
+        var (icon, color, tip) = BackendState();
+        StatusIcon(icon, color, tip);
+
+        // 显存 / 内存
+        var vramOk = ModelReady || _probe.VramFreeMB >= SystemProbe.RequiredVramMB || _config.BackendDevice == "cpu";
+        var vramText = _probe.VramFreeMB is { } free
+            ? Loc.F("{0}\n显存可用 {1:0.0} / {2:0.0} GB", _probe.GpuName, free / 1024f, _probe.VramTotalMB / 1024f)
+            : _probe.GpuError ?? Loc.T("读取中…");
+        vramText += ModelReady ? Loc.F("\n模型已加载（{0}）", DeviceLabel(_health?.Model.Device))
+            : _config.BackendDevice == "cpu" ? Loc.T("\n识别设备：CPU（不占显存）")
+            : Loc.F("\nGPU 识别约需 {0:0.0} GB", SystemProbe.RequiredVramMB / 1024f) + (vramOk ? ""
+                : _config.BackendDevice == "auto" ? Loc.T("，当前不足：将自动改用 CPU（约 10 秒/张）")
+                : Loc.T("，当前不足：显存溢出到共享内存后识别会极慢，游戏也可能崩溃。建议在设置里改为“自动”或“CPU”"));
+        StatusIcon(FontAwesomeIcon.Microchip, _probe.VramFreeMB is null ? Grey : vramOk ? Green : Yellow, vramText);
+        var ramOk = ModelReady || _probe.RamAvailMB >= SystemProbe.RequiredRamMB;
+        StatusIcon(FontAwesomeIcon.Memory, _probe.RamTotalMB == 0 ? Grey : ramOk ? Green : Yellow,
+                   Loc.F("内存可用 {0:0.0} / {1:0.0} GB", _probe.RamAvailMB / 1024f, _probe.RamTotalMB / 1024f) +
+                   (ramOk ? "" : Loc.F("\n加载模型约需 {0:0.0} GB，当前不足", SystemProbe.RequiredRamMB / 1024f)));
+
+        // 右侧：后端开关、模型加载/释放、设置
+        var right = ImGui.GetContentRegionMax().X - 3 * (ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.X);
+        ImGui.SetCursorPosX(Math.Max(ImGui.GetCursorPosX(), right));
+        if (BackendOnline || _process.IsRunning)
+        {
+            if (IconButton("##stopBackend", FontAwesomeIcon.PowerOff, Loc.T("停止后端（释放显存与内存）")))
+                StopBackend();
+        }
+        else
+        {
+            var problem = BackendProcess.Validate(_config);
+            var resources = _probe.RamAvailMB < SystemProbe.RequiredRamMB ? Loc.T("\n注意：当前可用内存低于建议值") : "";
+            if (IconButton("##startBackend", FontAwesomeIcon.Plug, problem ?? Loc.T("启动识别后端") + resources))
+            {
+                if (problem is null) StartBackend();
+                else
+                {
+                    SetError(problem);
+                    _selectTab = 4;
+                }
+            }
+        }
+        ImGui.SameLine();
+        if (ModelReady)
+        {
+            if (IconButton("##unload", FontAwesomeIcon.Eject, Loc.T("释放模型显存（下次识别会重新加载）")))
+                _ = Run(async () => { await _client.UnloadModelAsync(); SetStatus(Loc.T("已释放模型")); });
+        }
+        else if (IconButton("##load", FontAwesomeIcon.Download, Loc.T("预加载模型"), BackendOnline && _health?.Model.Loading != true))
+            _ = Run(async () => { await _client.LoadModelAsync(); SetStatus(Loc.T("模型加载中…")); });
+        ImGui.SameLine();
+        if (IconButton("##settings", FontAwesomeIcon.Cog, Loc.T("设置")))
+            _selectTab = 4;
+    }
+
+    private (FontAwesomeIcon, Vector4, string) BackendState()
+    {
+        if (_health is { } h)
+        {
+            if (h.Model.Error is { } err) return (FontAwesomeIcon.Server, Red, Loc.F("后端在线，模型加载失败：{0}", err));
+            if (h.Model.Loading) return (FontAwesomeIcon.Server, Yellow, Loc.T("后端在线，模型加载中…"));
+            var release = _config.ReleaseAfter switch { 0 => Loc.T("识别后立即释放"), < 0 => Loc.T("常驻"), var s => Loc.F("空闲 {0} 秒后释放", s) };
+            return (FontAwesomeIcon.Server, Green, Loc.F("后端在线 v{0}\n", h.Version) + (h.Model.Loaded
+                ? Loc.F("模型已加载：{0} {1}（{2}）", DeviceLabel(h.Model.Device), h.Model.Precision, h.Model.DeviceReason)
+                : Loc.T("模型未加载（识别时自动加载）")) + Loc.F("\n设备设置：{0}，{1}", DeviceLabel(_config.BackendDevice), release));
+        }
+        if (_process.IsRunning) return (FontAwesomeIcon.Server, Yellow, Loc.T("后端启动中…"));
+        var exit = _process.ExitCode is { } code ? Loc.F("\n上次启动的后端已退出（代码 {0}），见设置页日志", code) : "";
+        return (FontAwesomeIcon.Server, Grey, Loc.T("后端离线") + exit);
+    }
+
+    private static string DeviceLabel(string? device) => device switch
+    {
+        "cuda" => "GPU",
+        "cpu" => "CPU",
+        "auto" => Loc.T("自动"),
+        _ => device ?? "",
+    };
+
+    private void StartBackend()
+    {
+        try
+        {
+            _process.Start(_config);
+            SetStatus(Loc.T("后端启动中…"));
+        }
+        catch (Exception ex)
+        {
+            SetError(Loc.F("后端启动失败：{0}", ex.Message));
+        }
+    }
+
+    private void StopBackend()
+    {
+        if (_process.IsRunning) _process.Stop();
+        else _ = Run(_client.ShutdownAsync);
+        _health = null;
+        SetStatus(Loc.T("后端已停止"));
+    }
+
+    private Task Run(Func<Task> action) => Task.Run(async () =>
+    {
+        try { await action(); }
+        catch (Exception ex) { SetError(ex.Message); }
+    });
+
+    // ------------------------------------------------------------------ 识别与重定向
+
+    private void Recognize(string path)
+    {
+        if (_recognizing) return;
+        if (!BackendOnline)
+        {
+            SetError(Loc.T("后端离线：先点右上角电源按钮启动"));
+            return;
+        }
+        _recognizing = true;
+        _imagePath = path;
+        SetStatus(ModelReady ? Loc.T("识别中…") : Loc.T("加载模型并识别中（约 10~20 秒）…"), Yellow);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var bytes = await File.ReadAllBytesAsync(path);
+                var info = await _client.CreateSessionAsync(bytes, Path.GetFileNameWithoutExtension(path));
+                var png = await _client.SessionImageAsync(info.SessionId);
+                var tex = await _textures.CreateFromImageAsync(png);
+                Interlocked.Exchange(ref _newTexture, tex)?.Dispose();
+                _session = info;
+                _person = 0;
+                _result = null;
+                _params.Offsets.Clear();   // 手动偏移只对当前图有意义
+                _selected = null;
+                SetStatus(Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f), Green);
+                RequestRetarget(_config.PushAfterRecognize);
+            }
+            catch (Exception ex)
+            {
+                SetError(Loc.F("识别失败：{0}", ex.Message));
+            }
+            finally
+            {
+                _recognizing = false;
+            }
+        });
+    }
+
+    private void RequestRetarget(bool push)
+    {
+        if (_session is null) return;
+        _rtPush |= push;
+        if (_rtBusy)
+        {
+            _rtDirty = true;
+            return;
+        }
+        _rtBusy = true;
+        _ = Task.Run(RetargetLoop);
+    }
+
+    private async Task RetargetLoop()
+    {
+        try
+        {
+            do
+            {
+                _rtDirty = false;
+                var push = _rtPush;
+                _rtPush = false;
+                var session = _session!;
+                var reference = await ReferenceAsync();
+                var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference, _raceOverride ?? _detectedRace);
+                if (session != _session) continue;
+                _result = result;
+                if (push) await PushAsync(result.Pose);
+            } while (_rtDirty || _rtPush);
+        }
+        catch (Exception ex)
+        {
+            SetError(Loc.F("重定向失败：{0}", ex.Message));
+        }
+        finally
+        {
+            _rtBusy = false;
+        }
+    }
+
+    /// <summary>游戏内角色当前姿势：骨长/缩放按游戏实际值（种族、Customize+）。每个角色取一次并留作还原备份。</summary>
+    private async Task<string?> ReferenceAsync()
+    {
+        if (_referenceActor == _actor && _reference is not null) return _reference;
+        var pose = await _applier.GetPoseAsync(_actor);
+        if (pose is null) return null;
+        _detectedRace = await _applier.GetRaceAsync(_actor);
+        _reference = pose;
+        _referenceActor = _actor;
+        var key = _actor ?? -1;
+        _backups.TryAdd(key, pose);
+        return pose;
+    }
+
+    private async Task PushAsync(string pose)
+    {
+        if (!_clientState.IsGPosing)
+        {
+            SetStatus(Loc.T("不在 GPose：只更新了预览"), Yellow);
+            return;
+        }
+        var error = await _applier.ApplyAsync(_actor, pose);
+        if (error is null) SetStatus(Loc.T("已应用到角色"), Green);
+        else SetError(error);
+    }
+
+    private void ApplyNow()
+    {
+        if (_result is { } r) _ = Run(() => PushAsync(r.Pose));
+        else RequestRetarget(true);
+    }
+
+    private void Restore()
+    {
+        if (!_backups.TryGetValue(_actor ?? -1, out var backup)) return;
+        _ = Run(async () =>
+        {
+            var error = await _applier.ApplyAsync(_actor, backup);
+            if (error is null) SetStatus(Loc.T("已还原为第一次应用前的姿势"), Green);
+            else SetError(error);
+        });
+    }
+
+    private void ReplicateCamera()
+    {
+        if (_session is null) return;
+        if (!_server.IsRunning)
+        {
+            SetError(Loc.T("复刻镜头需要 Posegraph HTTP 服务（/posegraph on）"));
+            return;
+        }
+        SetStatus(Loc.T("复刻镜头中（约 10 秒，画面会跳动）…"), Yellow);
+        _ = Run(async () =>
+        {
+            var r = await _client.CameraAsync(_session.SessionId, _person, _params.Clone(), _actor, _raceOverride ?? _detectedRace);
+            SetStatus(Loc.F("镜头已复刻：机位误差 {0:0.0}cm，构图偏差 {1:0.0}%", r.PositionErrorCm, r.FramingErrorPct), Green);
+        });
+    }
+
+    private void Export()
+    {
+        if (_result is not { } r) return;
+        var name = _session?.Name ?? "pose";
+        var dir = Directory.Exists(_config.ExportDir) ? _config.ExportDir : null;
+        _fileDialog.SaveFileDialog(Loc.T("导出 Brio 姿势"), ".pose", name, ".pose", (ok, path) =>
+        {
+            if (!ok) return;
+            try
+            {
+                File.WriteAllText(path, r.Pose);
+                _config.ExportDir = Path.GetDirectoryName(path) ?? "";
+                _pi.SavePluginConfig(_config);
+                SetStatus(Loc.F("已导出 {0}", Path.GetFileName(path)), Green);
+            }
+            catch (Exception ex)
+            {
+                SetError(Loc.F("导出失败：{0}", ex.Message));
+            }
+        }, dir, true);
+    }
+
+    private void OpenImageDialog()
+    {
+        var dir = Directory.Exists(_config.LastImageDir) ? _config.LastImageDir : null;
+        _fileDialog.OpenFileDialog(Loc.T("选择图片"), Loc.T("图片") + ImageExtensions, (ok, paths) =>
+        {
+            if (!ok || paths.Count == 0) return;
+            _config.LastImageDir = Path.GetDirectoryName(paths[0]) ?? "";
+            _pi.SavePluginConfig(_config);
+            Recognize(paths[0]);
+        }, 1, dir, true);
+    }
+
+    // ------------------------------------------------------------------ 绘制
+
+    public override void Draw()
+    {
+        if (Interlocked.Exchange(ref _newTexture, null) is { } tex)
+        {
+            _texture?.Dispose();
+            _texture = tex;
+        }
+        PollHealth();
+        RefreshActors();
+        DragSource();
+
+        DrawStatusBar();
+        DrawToolbar();
+
+        var footer = ImGui.GetFrameHeightWithSpacing() + ImGui.GetTextLineHeightWithSpacing();
+        if (ImGui.BeginTabBar("##tabs"))
+        {
+            Tab(0, Loc.T("图像"), DrawImageTab, footer);
+            Tab(1, "3D", DrawStickTab, footer);
+            Tab(2, Loc.T("调整"), DrawTuningTab, footer);
+            var warnings = _result?.Warnings.Length ?? 0;
+            Tab(3, warnings > 0 ? Loc.F("提示 ({0})###warn", warnings) : Loc.T("提示###warn"), DrawWarningsTab, footer);
+            Tab(4, Loc.T("设置"), DrawSettingsTab, footer);
+            _selectTab = null;
+            ImGui.EndTabBar();
+        }
+        DrawFooter();
+        _fileDialog.Draw();
+    }
+
+    private void Tab(int index, string label, Action draw, float footer)
+    {
+        if (!ImGui.BeginTabItem(label, _selectTab == index ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None)) return;
+        using (var child = ImRaii.Child($"##tab{index}", new Vector2(0, -footer)))
+            if (child) draw();
+        ImGui.EndTabItem();
+    }
+
+    private void DrawToolbar()
+    {
+        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（jpg/png/webp/bmp/gif/tiff/avif），也可以把图片拖到图像页"),
+                       !_recognizing))
+            OpenImageDialog();
+        ImGui.SameLine();
+        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _imagePath is not null && !_recognizing))
+            Recognize(_imagePath!);
+        ImGui.SameLine();
+
+        // 角色
+        ImGui.SetNextItemWidth(Math.Min(150, ImGui.GetContentRegionAvail().X * 0.4f));
+        var label = _actor is null ? Loc.T("GPose 目标") : _actors.FirstOrDefault(a => a.Index == _actor).Name ?? $"#{_actor}";
+        if (ImGui.BeginCombo("##actor", label))
+        {
+            if (ImGui.Selectable(Loc.T("GPose 目标"), _actor is null)) SelectActor(null);
+            foreach (var (index, name) in _actors)
+                if (ImGui.Selectable($"{name}##{index}", _actor == index)) SelectActor(index);
+            ImGui.EndCombo();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("要摆姿势的角色"));
+        ImGui.SameLine();
+
+        // 多人（预留）：目前整图按一个人识别
+        var humans = _session?.Humans.Length ?? 0;
+        using (ImRaii.Disabled(humans <= 1))
+        {
+            ImGui.SetNextItemWidth(60);
+            if (ImGui.BeginCombo("##person", humans <= 1 ? Loc.T("1 人") : Loc.F("第 {0} 人", _person + 1)))
+            {
+                for (var i = 0; i < humans; i++)
+                    if (ImGui.Selectable(Loc.F("第 {0} 人", i + 1), _person == i))
+                    {
+                        _person = i;
+                        RequestRetarget(false);
+                    }
+                ImGui.EndCombo();
+            }
+        }
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(Loc.T("图中人物（多人识别预留，目前整图按一个人处理）"));
+        ImGui.SameLine();
+        DrawRaceCombo();
+        ImGui.SameLine();
+        IconButton("##video", FontAwesomeIcon.Film, Loc.T("视频逐帧（预留）"), false);
+        if (_recognizing || _rtBusy)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(Yellow, _recognizing ? Loc.T("识别中…") : Loc.T("计算中…"));
+        }
+    }
+
+    private void SelectActor(int? index)
+    {
+        _actor = index;
+        _reference = null;
+        _detectedRace = null;
+        RequestRetarget(false);
+    }
+
+    /// <summary>种族骨架：默认按角色外貌自动识别，可手动指定（换种族 MOD、识别不到时）。</summary>
+    private void DrawRaceCombo()
+    {
+        var used = _result?.Race;
+        var label = _raceOverride is not null ? Races.Label(_raceOverride)
+            : used is not null ? used.Name : _detectedRace is not null ? Races.Label(_detectedRace) : Loc.T("种族");
+        var warn = used is { Warnings.Length: > 0 };
+        ImGui.SetNextItemWidth(Math.Min(110, ImGui.GetContentRegionAvail().X * 0.3f));
+        if (ImGui.BeginCombo("##race", warn ? label + " (!)" : label))
+        {
+            if (ImGui.Selectable(Loc.F("自动（{0}）", (_detectedRace is null ? Loc.T("按骨长推断") : Races.Label(_detectedRace))), _raceOverride is null))
+                SelectRace(null);
+            string? group = null;
+            foreach (var r in Races.All)
+            {
+                if (r.Group != group)
+                {
+                    ImGui.TextDisabled(Loc.T(r.Group));
+                    group = r.Group;
+                }
+                if (ImGui.Selectable(Loc.F("  {0}{1}##{2}", Loc.T(r.Name), (r.Validated ? "" : Loc.T("（未实测）")), r.Code), _raceOverride == r.Code))
+                    SelectRace(r.Code);
+            }
+            ImGui.EndCombo();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            var source = used?.Source switch
+            {
+                "plugin" => _raceOverride is null ? Loc.T("按角色外貌识别") : Loc.T("手动指定"),
+                "guess" => Loc.T("按游戏内骨长推断"),
+                "default" => Loc.T("未能识别，使用默认"),
+                _ => Loc.T("尚未计算"),
+            };
+            var tip = used is null ? Loc.T("种族骨架（应用姿势前自动识别）")
+                : Loc.F("骨架：{0}（{1}，{2}），{3}", used.Name, used.Code, used.Group, source) + (used.Warnings.Length > 0 ? "\n" + string.Join("\n", used.Warnings) : "");
+            ImGui.SetTooltip(tip);
+        }
+    }
+
+    private void SelectRace(string? code)
+    {
+        _raceOverride = code;
+        RequestRetarget(_config.PushOnRelease);
+    }
+
+    private void DrawFooter()
+    {
+        var hasResult = _result is not null;
+        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing))
+            ApplyNow();
+        ImGui.SameLine();
+        if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing))
+            ReplicateCamera();
+        ImGui.SameLine();
+        if (IconButton("##restore", FontAwesomeIcon.Undo, Loc.T("还原为第一次应用前的姿势"), _backups.ContainsKey(_actor ?? -1) && _clientState.IsGPosing))
+            Restore();
+        ImGui.SameLine();
+        if (IconButton("##export", FontAwesomeIcon.Save, Loc.T("导出 Brio 姿势文件（.pose）"), hasResult))
+            Export();
+        ImGui.SameLine();
+        var autoPush = _config.PushOnRelease;
+        if (ImGui.Checkbox("##autopush", ref autoPush))
+        {
+            _config.PushOnRelease = autoPush;
+            _pi.SavePluginConfig(_config);
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("松开滑杆时自动应用到角色"));
+
+        ImGui.TextColored(_statusColor, _statusText);
+        if (ImGui.IsItemHovered() && _statusText.Length > 30) ImGui.SetTooltip(_statusText);
+    }
+
+    // ---------------- 图像页
+
+    private void DrawImageTab()
+    {
+        var showMhr = _config.ShowMhrOverlay;
+        var showFf = _config.ShowFfxivOverlay;
+        var toggled = ImGui.Checkbox(Loc.T("识别骨架（绿）"), ref showMhr);
+        ImGui.SameLine();
+        toggled |= ImGui.Checkbox(Loc.T("FF14 骨架（橙）"), ref showFf);
+        if (toggled)
+        {
+            _config.ShowMhrOverlay = showMhr;
+            _config.ShowFfxivOverlay = showFf;
+            _pi.SavePluginConfig(_config);
+        }
+
+        var avail = ImGui.GetContentRegionAvail();
+        if (_texture is null || _session is null)
+        {
+            ImGui.Button(_recognizing ? Loc.T("识别中…") : Loc.T("点左上角文件夹选图\n或把图片拖到这里"), new Vector2(avail.X, Math.Max(80, avail.Y)));
+            DropTarget();
+            return;
+        }
+        var imgW = _session.ImageSize[0];
+        var imgH = _session.ImageSize[1];
+        var scale = Math.Min(avail.X / imgW, avail.Y / imgH);
+        var size = new Vector2(imgW, imgH) * scale;
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail.X - size.X) / 2);
+        var origin = ImGui.GetCursorScreenPos();
+        ImGui.Image(_texture.Handle, size);
+        // Image 没有 ID，不能直接作拖放目标；在同一位置放一个隐形按钮接收
+        ImGui.SetCursorScreenPos(origin);
+        ImGui.InvisibleButton("##imageDrop", size);
+        DropTarget();
+
+        if (_result?.Overlay is not { } ov) return;
+        var dl = ImGui.GetWindowDrawList();
+        if (showMhr) DrawSegments(dl, ov.Mhr, origin, scale, MhrGreen);
+        if (showFf) DrawSegments(dl, ov.Ffxiv, origin, scale, Orange);
+    }
+
+    /// <summary>左侧实线，右侧细线加端点（检查左右是否颠倒），与 preview_overlay.py 一致。</summary>
+    private static void DrawSegments(ImDrawListPtr dl, Segment[] segments, Vector2 origin, float scale, Vector4 color)
+    {
+        var col = ImGui.GetColorU32(color);
+        foreach (var s in segments)
+        {
+            var a = origin + new Vector2(s.A[0], s.A[1]) * scale;
+            var b = origin + new Vector2(s.B[0], s.B[1]) * scale;
+            var right = s.Side == "r";
+            dl.AddLine(a, b, col, right ? 1.5f : 2.5f);
+            if (right) dl.AddCircleFilled(b, 2.5f, col);
+        }
+    }
+
+    private const string DragLabel = "PosegraphImage";
+
+    private static bool IsImage(string path)
+        => Path.GetExtension(path) is { Length: > 1 } ext && ImageExtensions.Contains(ext.ToLowerInvariant());
+
+    /// <summary>
+    /// 外部文件拖放分两步：每帧用 CreateImGuiSource 把系统拖动转成 ImGui 拖放负载，再由目标区域用 CreateImGuiTarget 接收。
+    /// 拖着图片进入窗口时自动切到图像页。
+    /// </summary>
+    private void DragSource()
+    {
+        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImage), m =>
+        {
+            ImGui.TextUnformatted(Loc.F("松开以识别：{0}", Path.GetFileName(m.Files.First(IsImage))));
+            return true;
+        });
+        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImage))
+            _selectTab = 0;
+    }
+
+    private void DropTarget()
+    {
+        if (!_dragDrop.CreateImGuiTarget(DragLabel, out var files, out _)) return;
+        var file = files.FirstOrDefault(IsImage);
+        if (file is null) SetError(Loc.T("不支持的文件格式"));
+        else Recognize(file);
+    }
+
+    // ---------------- 3D 火柴人
+
+    private static readonly Dictionary<string, string> JointNames = new()
+    {
+        ["j_kosi"] = "腰", ["j_sebo_a"] = "腰椎", ["j_sebo_b"] = "上背", ["j_sebo_c"] = "胸", ["j_kubi"] = "颈", ["j_kao"] = "头",
+        ["j_sako"] = "锁骨", ["j_ude_a"] = "肩（上臂）", ["j_ude_b"] = "肘（前臂）", ["j_te"] = "手腕", ["j_naka_a"] = "手",
+        ["j_asi_a"] = "髋（大腿）", ["j_asi_c"] = "膝（小腿）", ["j_asi_d"] = "脚踝", ["j_asi_e"] = "脚尖",
+    };
+
+    private static string JointLabel(string bone)
+    {
+        var side = bone.EndsWith("_l") ? Loc.T("左") : bone.EndsWith("_r") ? Loc.T("右") : "";
+        var key = side.Length > 0 ? bone[..^2] : bone;
+        return side + (JointNames.TryGetValue(key, out var n) ? Loc.T(n) : bone);
+    }
+
+    private void DrawStickTab()
+    {
+        if (_result?.Stick is not { } stick)
+        {
+            ImGui.TextDisabled(Loc.T("识别后在这里查看 FF14 骨架（拖动旋转、滚轮缩放、点选关节微调）"));
+            return;
+        }
+        var avail = ImGui.GetContentRegionAvail();
+        var panel = _selected is null ? ImGui.GetTextLineHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
+        var size = new Vector2(avail.X, Math.Max(140, avail.Y - panel));
+        var origin = ImGui.GetCursorScreenPos();
+        ImGui.InvisibleButton("##stick", size);
+        var io = ImGui.GetIO();
+        if (ImGui.IsItemActive() && ImGui.IsMouseDragging(ImGuiMouseButton.Left, 3))
+        {
+            _yaw += io.MouseDelta.X * 0.01f;
+            _pitch = Math.Clamp(_pitch + io.MouseDelta.Y * 0.01f, -1.5f, 1.5f);
+            _dragged = true;
+        }
+        if (ImGui.IsItemHovered() && io.MouseWheel != 0)
+            _zoom = Math.Clamp(_zoom * (1 + io.MouseWheel * 0.1f), 0.3f, 5f);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("拖动旋转，滚轮缩放，点击关节选中；双击复位视角"));
+        if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+            (_yaw, _pitch, _zoom) = (0, 0.15f, 1);
+
+        var joints = stick.Joints.ToDictionary(j => j.Name);
+        var center = joints.TryGetValue("j_kosi", out var hip) ? ToVec(hip.Pos) : Vector3.Zero;
+        var scale = size.Y / 2.1f * _zoom;
+        var mid = origin + size / 2;
+        Vector2 Project(Vector3 p)
+        {
+            p -= center;
+            var (sy, cy) = MathF.SinCos(_yaw);
+            var (sp, cp) = MathF.SinCos(_pitch);
+            var x = p.X * cy + p.Z * sy;
+            var z = -p.X * sy + p.Z * cy;
+            var y = p.Y * cp - z * sp;
+            // 从角色正前方看：模型 +x（角色左侧）在屏幕右侧
+            return mid + new Vector2(x, -y) * scale;
+        }
+
+        if (ImGui.IsItemDeactivated())
+        {
+            if (!_dragged)
+            {
+                var mouse = ImGui.GetMousePos();
+                var hit = stick.Joints.Select(j => (j.Name, D: Vector2.Distance(Project(ToVec(j.Pos)), mouse)))
+                    .Where(t => t.D < 10).OrderBy(t => t.D).Select(t => t.Name).FirstOrDefault();
+                _selected = hit;
+            }
+            _dragged = false;
+        }
+
+        var dl = ImGui.GetWindowDrawList();
+        dl.PushClipRect(origin, origin + size, true);
+        dl.AddRectFilled(origin, origin + size, ImGui.GetColorU32(new Vector4(0.08f, 0.08f, 0.1f, 0.85f)), 4);
+
+        // 地面网格与朝向
+        var floor = stick.Joints.Min(j => j.Pos[1]);
+        var grid = ImGui.GetColorU32(new Vector4(1, 1, 1, 0.12f));
+        for (var i = -3; i <= 3; i++)
+        {
+            var t = i * 0.25f;
+            dl.AddLine(Project(new Vector3(center.X + t, floor, center.Z - 0.75f)), Project(new Vector3(center.X + t, floor, center.Z + 0.75f)), grid);
+            dl.AddLine(Project(new Vector3(center.X - 0.75f, floor, center.Z + t)), Project(new Vector3(center.X + 0.75f, floor, center.Z + t)), grid);
+        }
+        var front = Project(new Vector3(center.X, floor, center.Z + 0.6f));
+        dl.AddLine(Project(new Vector3(center.X, floor, center.Z)), front, ImGui.GetColorU32(new Vector4(1, 1, 1, 0.35f)), 2);
+        dl.AddText(front, ImGui.GetColorU32(new Vector4(1, 1, 1, 0.5f)), Loc.T("前"));
+
+        if (_config.ShowMhrInStick)
+        {
+            var mc = ImGui.GetColorU32(MhrGreen with { W = 0.6f });
+            foreach (var s in stick.Mhr)
+                dl.AddLine(Project(new Vector3(s.A[0], s.A[1], s.A[2])), Project(new Vector3(s.B[0], s.B[1], s.B[2])), mc, 1.5f);
+        }
+
+        var severity = _result.Severity;
+        foreach (var j in stick.Joints)
+        {
+            if (j.Parent is null || !joints.TryGetValue(j.Parent, out var parent)) continue;
+            var color = j.Name.EndsWith("_l") ? Orange : j.Name.EndsWith("_r") ? new Vector4(0.35f, 0.65f, 1f, 1) : new Vector4(0.9f, 0.9f, 0.9f, 1);
+            dl.AddLine(Project(ToVec(parent.Pos)), Project(ToVec(j.Pos)), ImGui.GetColorU32(color), 3);
+        }
+        foreach (var j in stick.Joints)
+        {
+            var p = Project(ToVec(j.Pos));
+            var level = severity.GetValueOrDefault(j.Name);
+            var color = level == "bad" ? Red : level == "warn" ? Yellow : new Vector4(0.85f, 0.85f, 0.85f, 1);
+            var radius = level is null ? 3f : 5f;
+            if (_params.Offsets.TryGetValue(j.Name, out var off) && off.Any(v => v != 0))
+                dl.AddCircle(p, radius + 3, ImGui.GetColorU32(new Vector4(0.7f, 0.5f, 1f, 1)), 0, 1.5f);
+            dl.AddCircleFilled(p, radius, ImGui.GetColorU32(color));
+            if (j.Name == _selected)
+                dl.AddCircle(p, radius + 5, ImGui.GetColorU32(new Vector4(0.3f, 0.9f, 1f, 1)), 0, 2);
+        }
+        dl.PopClipRect();
+
+        DrawJointPanel();
+    }
+
+    private static Vector3 ToVec(float[] p) => new(p[0], p[1], p[2]);
+
+    private void DrawJointPanel()
+    {
+        if (_selected is not { } bone)
+        {
+            var mhr = _config.ShowMhrInStick;
+            if (ImGui.Checkbox(Loc.T("叠加识别骨架"), ref mhr))
+            {
+                _config.ShowMhrInStick = mhr;
+                _pi.SavePluginConfig(_config);
+            }
+            ImGui.SameLine();
+            ImGui.TextDisabled(Loc.T("黄/红点：超出游戏常见范围"));
+            return;
+        }
+        ImGui.Text($"{JointLabel(bone)}  ");
+        ImGui.SameLine();
+        ImGui.TextDisabled(bone);
+        ImGui.SameLine();
+        if (IconButton("##resetJoint", FontAwesomeIcon.UndoAlt, Loc.T("清除这个关节的手动偏移"), _params.Offsets.ContainsKey(bone)))
+        {
+            _params.Offsets.Remove(bone);
+            RequestRetarget(_config.PushOnRelease);
+        }
+        ImGui.SameLine();
+        if (IconButton("##deselect", FontAwesomeIcon.Times, Loc.T("取消选中")))
+            _selected = null;
+        foreach (var w in _result?.Warnings.Where(w => w.Bone == bone) ?? [])
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(w.Level == "bad" ? Red : Yellow, $"{w.Value:0}°/{w.Limit:0}°");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(w.Message);
+        }
+
+        var off = _params.Offsets.TryGetValue(bone, out var v) ? (float[])v.Clone() : new float[3];
+        string[] axes = [Loc.T("前后俯仰（绕左右轴）"), Loc.T("水平转（绕竖直轴）"), Loc.T("侧倾（绕前后轴）")];
+        var width = (ImGui.GetContentRegionAvail().X - 2 * ImGui.GetStyle().ItemSpacing.X) / 3;
+        for (var i = 0; i < 3; i++)
+        {
+            if (i > 0) ImGui.SameLine();
+            ImGui.SetNextItemWidth(width);
+            var changed = ImGui.SliderFloat($"##off{i}", ref off[i], -90, 90, "%.0f°");
+            ItemTip(Loc.F("{0}：绕这个关节转动它下面的整段肢体（模型坐标轴）。右键归零", axes[i]));
+            if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+            {
+                off[i] = 0;
+                changed = true;
+            }
+            if (changed)
+            {
+                _params.Offsets[bone] = off;
+                RequestRetarget(false);
+            }
+            if (ImGui.IsItemDeactivatedAfterEdit() || (changed && ImGui.IsItemClicked(ImGuiMouseButton.Right)))
+                RequestRetarget(_config.PushOnRelease);
+        }
+    }
+
+    private static void ItemTip(string tip)
+    {
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(tip);
+    }
+
+    // ---------------- 调整页
+
+    /// <summary>拖动中只刷新预览，松手才应用到角色；右键恢复默认值。</summary>
+    private void Slider(string label, ref float value, float min, float max, string format, float def, string tip)
+    {
+        ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 90));
+        var changed = ImGui.SliderFloat(label, ref value, min, max, format);
+        ItemTip(tip + Loc.F("\n右键恢复默认（{0:0.##}）", def));
+        if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+        {
+            value = def;
+            RequestRetarget(_config.PushOnRelease);
+            return;
+        }
+        if (changed) RequestRetarget(false);
+        if (ImGui.IsItemDeactivatedAfterEdit()) RequestRetarget(_config.PushOnRelease);
+    }
+
+    private void Toggle(string label, ref bool value, string tip)
+    {
+        if (ImGui.Checkbox(label, ref value)) RequestRetarget(_config.PushOnRelease);
+        ItemTip(tip);
+    }
+
+    private void DrawTuningTab()
+    {
+        ImGui.SetNextItemWidth(110);
+        var presetLabel = _preset == "illustration" ? Loc.T("插画") : Loc.T("照片");
+        if (ImGui.BeginCombo("##preset", presetLabel))
+        {
+            foreach (var (key, name) in new[] { ("photo", Loc.T("照片")), ("illustration", Loc.T("插画")) })
+                if (ImGui.Selectable(name, _preset == key))
+                {
+                    _preset = key;
+                    var offsets = _params.Offsets;
+                    _params = RetargetParams.Preset(key);
+                    _params.Offsets = offsets;
+                    _config.DefaultPreset = key;
+                    _pi.SavePluginConfig(_config);
+                    RequestRetarget(_config.PushOnRelease);
+                }
+            ImGui.EndCombo();
+        }
+        ItemTip(Loc.T("预设：插画会把颈/头幅度设为 0.7（游戏实测合适）"));
+        ImGui.SameLine();
+        if (IconButton("##resetAll", FontAwesomeIcon.UndoAlt, Loc.T("全部恢复预设值（含手动偏移）")))
+        {
+            _params = RetargetParams.Preset(_preset);
+            RequestRetarget(_config.PushOnRelease);
+        }
+
+        if (ImGui.CollapsingHeader(Loc.T("幅度"), ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            foreach (var (key, label, tip) in AmplitudeGroups)
+            {
+                var v = _params.Amp(key);
+                var before = v;
+                Slider($"{Loc.T(label)}##amp{key}", ref v, 0, 1.5f, "%.2f", RetargetParams.Preset(_preset).Amp(key),
+                       Loc.T(tip) + Loc.T("\n1 = 照片原样，<1 收敛，>1 夸张"));
+                if (v != before) _params.Amplitude[key] = v;
+            }
+        }
+        if (ImGui.CollapsingHeader(Loc.T("手部末端补偿")))
+        {
+            var p = _params;
+            var s = p.HandStrength;
+            Slider(Loc.T("强度##hand"), ref s, 0, 1, "%.2f", 1, Loc.T("手靠近头/胸/髋时，用 IK 保持手与身体部位的相对位置（两套骨架比例不同，只复制角度会错位）。0 关闭"));
+            p.HandStrength = s;
+            var near = p.HandNear * 100;
+            Slider(Loc.T("完全生效##near"), ref near, 5, 60, "%.0f cm", 20, Loc.T("手腕距部位小于这个距离时完全按部位相对位置放置"));
+            p.HandNear = Math.Min(near, p.HandFar * 100 - 1) / 100;
+            var far = p.HandFar * 100;
+            Slider(Loc.T("不再生效##far"), ref far, 10, 80, "%.0f cm", 40, Loc.T("手腕距部位大于这个距离时只复制角度"));
+            p.HandFar = Math.Max(far, p.HandNear * 100 + 1) / 100;
+        }
+        if (ImGui.CollapsingHeader(Loc.T("站姿")))
+        {
+            var upright = _params.Upright;
+            Toggle(Loc.T("重力校正"), ref upright, Loc.T("照片相机俯仰/侧倾会让人整体歪斜：双脚着地时把重心摆到支撑脚正上方。半身照（脚不在画面内）自动跳过"));
+            _params.Upright = upright;
+            using (ImRaii.Disabled(!upright))
+            {
+                var max = _params.UprightMaxDeg;
+                Slider(Loc.T("校正上限##upmax"), ref max, 0, 45, "%.0f°", 30, Loc.T("倾斜超过这个角度视为有意的姿势（如倾身），不校正"));
+                _params.UprightMaxDeg = max;
+            }
+            var ground = _params.Ground;
+            Toggle(Loc.T("自动贴地"), ref ground, Loc.T("把最低的关节放到地面（跪坐/躺下不悬空）。跳跃、腾空的图请关闭"));
+            _params.Ground = ground;
+        }
+        if (ImGui.CollapsingHeader(Loc.T("辅助骨")))
+        {
+            var h = _params.HelperStrength;
+            Slider(Loc.T("联动强度##helper"), ref h, 0, 1.5f, "%.2f", 1, Loc.T("肘/腕/肩/膝辅助骨按游戏动画采样的联动规则转动，防止关节处蒙皮变形。1 为游戏拟合值"));
+            _params.HelperStrength = h;
+        }
+        if (_result is { } r)
+        {
+            ImGui.Separator();
+            ImGui.TextDisabled(Loc.F("重定向 {0:0} ms  补偿 {1}", r.ElapsedMs, Compact(r.Compensation)));
+        }
+    }
+
+    private static string Compact(System.Text.Json.JsonElement e)
+    {
+        var parts = new List<string>();
+        if (e.ValueKind != System.Text.Json.JsonValueKind.Object) return "";
+        foreach (var p in e.EnumerateObject())
+        {
+            var text = p.Name switch
+            {
+                "l" or "r" => Loc.F("{0}手 {1:0}cm", (p.Name == "l" ? Loc.T("左") : Loc.T("右")), p.Value.GetProperty("shift_cm").GetDouble()),
+                "upright_deg" => Loc.F("重力 {0:0.0}°", p.Value.GetDouble()),
+                "ground_drop_cm" => Loc.F("贴地 {0:0}cm", p.Value.GetDouble()),
+                _ => null,
+            };
+            if (text is not null) parts.Add(text);
+        }
+        return string.Join(Loc.T("，"), parts);
+    }
+
+    // ---------------- 提示页
+
+    private void DrawWarningsTab()
+    {
+        if (_result is not { } r)
+        {
+            ImGui.TextDisabled(Loc.T("识别后在这里显示合理性检查"));
+            return;
+        }
+        foreach (var w in r.Race?.Warnings ?? [])
+            ImGui.TextColored(Yellow, w);
+        if (r.Warnings.Length == 0)
+        {
+            ImGui.TextColored(Green, Loc.T("没有发现超出游戏常见范围的关节"));
+            return;
+        }
+        for (var i = 0; i < r.Warnings.Length; i++)
+        {
+            var w = r.Warnings[i];
+            var color = w.Level == "bad" ? Red : w.Level == "warn" ? Yellow : Grey;
+            StatusIcon(w.Level == "info" ? FontAwesomeIcon.InfoCircle : FontAwesomeIcon.ExclamationTriangle, color,
+                       Loc.F("{0}：{1:0.#}（阈值 {2:0.#}）", w.Bone, w.Value, w.Limit));
+            ImGui.TextWrapped(Loc.F("{0}：{1}", JointLabel(w.Bone), w.Message));
+            ItemTip(Loc.T("点击在 3D 页查看这个关节"));
+            if (ImGui.IsItemClicked())
+            {
+                _selected = w.Bone;
+                _selectTab = 1;
+            }
+            if (w.Group is { } group && w.Suggest is { } suggest && Math.Abs(_params.Amp(group) - suggest) > 0.01f &&
+                _params.Amp(group) > suggest)
+            {
+                var name = Loc.T(AmplitudeGroups.FirstOrDefault(g => g.Key == group).Label ?? group);
+                if (ImGui.SmallButton(Loc.F("把{0}幅度设为 {1:0.0#}##sug{2}", name, suggest, i)))
+                {
+                    _params.Amplitude[group] = suggest;
+                    RequestRetarget(_config.PushOnRelease);
+                }
+            }
+            ImGui.Spacing();
+        }
+    }
+
+    // ---------------- 设置页
+
+    private void DrawSettingsTab()
+    {
+        var changed = false;
+        ImGui.SetNextItemWidth(200);
+        var langLabel = Loc.Languages.FirstOrDefault(l => l.Key == _config.Language).Label ?? _config.Language;
+        if (ImGui.BeginCombo(Loc.T("语言 / Language"), _config.Language == "auto" ? Loc.T(langLabel) : langLabel))
+        {
+            foreach (var (key, label) in Loc.Languages)
+                if (ImGui.Selectable(key == "auto" ? Loc.T(label) : label, _config.Language == key))
+                {
+                    _config.Language = key;
+                    Loc.Apply(key, _clientState, _pi);
+                    changed = true;
+                }
+            ImGui.EndCombo();
+        }
+        ItemTip(Loc.T("自动：游戏客户端是中文时用中文，否则看 Dalamud 界面语言，都不是中文则用英文"));
+
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("识别后端（backend）"));
+        if (ImGui.Button(Loc.T("选择一键包目录…")))
+            _fileDialog.OpenFolderDialog(Loc.T("选择一键包解压后的目录"), (ok, path) =>
+            {
+                if (!ok) return;
+                if (!BackendProcess.TryUsePackage(_config, path))
+                {
+                    SetError(Loc.F("不是 Posegraph 一键包目录（缺少 python\\python.exe 或 backend）：{0}", path));
+                    return;
+                }
+                _pi.SavePluginConfig(_config);
+                SetStatus(Loc.T("已设置一键包路径"), Green);
+            }, null, true);
+        ItemTip(Loc.T("一键包解压后的目录（含 python 与 backend 两个文件夹），会自动填好下面两项"));
+        var python = _config.BackendPython;
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - ImGui.GetFrameHeight() - 60);
+        if (ImGui.InputText("python##py", ref python, 512)) { _config.BackendPython = python.Trim('"'); changed = true; }
+        ItemTip(Loc.T(@"后端的 python.exe：一键包里是 <解压目录>\python\python.exe，源码安装是 backend\.venv\Scripts\python.exe"));
+        ImGui.SameLine();
+        if (IconButton("##browsePy", FontAwesomeIcon.FolderOpen, Loc.T("浏览")))
+            _fileDialog.OpenFileDialog(Loc.T("选择 python.exe"), "python{.exe}", (ok, paths) =>
+            {
+                if (!ok || paths.Count == 0) return;
+                _config.BackendPython = paths[0];
+                // 常见布局：backend\.venv\Scripts\python.exe
+                var guess = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(paths[0])!, "..", ".."));
+                if (string.IsNullOrEmpty(_config.BackendDir) && File.Exists(Path.Combine(guess, "src", "posegraph", "app.py")))
+                    _config.BackendDir = guess;
+                _pi.SavePluginConfig(_config);
+            }, 1, null, true);
+
+        var dir = _config.BackendDir;
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - ImGui.GetFrameHeight() - 60);
+        if (ImGui.InputText(Loc.T("目录##dir"), ref dir, 512)) { _config.BackendDir = dir.Trim('"'); changed = true; }
+        ItemTip(Loc.T("backend 目录（含 src\\posegraph）"));
+        ImGui.SameLine();
+        if (IconButton("##browseDir", FontAwesomeIcon.FolderOpen, Loc.T("浏览")))
+            _fileDialog.OpenFolderDialog(Loc.T("选择 backend 目录"), (ok, path) =>
+            {
+                if (!ok) return;
+                _config.BackendDir = path;
+                _pi.SavePluginConfig(_config);
+            }, null, true);
+
+        var problem = BackendProcess.Validate(_config);
+        if (problem is null) ImGui.TextColored(Green, Loc.T("路径有效"));
+        else ImGui.TextColored(Yellow, problem);
+
+        var port = _config.BackendPort;
+        ImGui.SetNextItemWidth(100);
+        if (ImGui.InputInt(Loc.T("后端端口"), ref port, 0)) { _config.BackendPort = Math.Clamp(port, 1024, 65535); changed = true; }
+
+        changed |= Check(Loc.T("插件加载时自动启动后端"), _config.AutoStartBackend, v => _config.AutoStartBackend = v);
+        var modelChanged = DrawDeviceSettings();
+        using (ImRaii.Disabled(_config.ReleaseAfter == 0))
+            changed |= Check(Loc.T("启动后预加载模型"), _config.PreloadModel, v => _config.PreloadModel = v,
+                             Loc.T("首次识别不用等加载；“识别后立即释放”时无效"));
+        if (modelChanged && BackendOnline)
+            _ = Run(async () => { await _client.ConfigureAsync(_config); SetStatus(Loc.T("已更新识别设备设置（下次加载生效）")); });
+        changed |= modelChanged;
+        changed |= Check(Loc.T("退出时关闭插件启动的后端"), _config.StopBackendOnExit, v => _config.StopBackendOnExit = v);
+
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("操作"));
+        changed |= Check(Loc.T("松开滑杆时自动应用到角色"), _config.PushOnRelease, v => _config.PushOnRelease = v);
+        changed |= Check(Loc.T("识别完成后立即应用到角色"), _config.PushAfterRecognize, v => _config.PushAfterRecognize = v);
+
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(_server.IsRunning ? Loc.T("停止") : Loc.T("启动")))
+        {
+            if (_server.IsRunning) _server.Stop();
+            else
+            {
+                try { _server.Start(_config.Port); }
+                catch (Exception ex) { SetError(Loc.F("端口 {0} 启动失败：{1}", _config.Port, ex.Message)); }
+            }
+        }
+
+        if (changed) _pi.SavePluginConfig(_config);
+
+        if (ImGui.CollapsingHeader(Loc.T("后端日志")))
+        {
+            using var child = ImRaii.Child("##log", new Vector2(0, 160), true);
+            foreach (var line in _process.Log)
+                ImGui.TextUnformatted(line);
+            if (ImGui.GetScrollY() >= ImGui.GetScrollMaxY()) ImGui.SetScrollHereY(1);
+        }
+    }
+
+    private static readonly (string Key, string Label, string Tip)[] Devices =
+    [
+        ("auto", "自动", "可用显存足够（约 3GB）时用 GPU，否则用 CPU"),
+        ("cuda", "GPU", "总是用显卡（约 1.5 秒/张）。显存紧张时可能拖慢甚至挤崩游戏"),
+        ("cpu", "CPU", "不占显存（约 10 秒/张，取决于 CPU），内存约需 4GB"),
+    ];
+
+    private static readonly (int Seconds, string Label)[] ReleasePolicies =
+        [(0, "识别后立即释放"), (60, "空闲 1 分钟后释放"), (300, "空闲 5 分钟后释放"), (-1, "常驻（不释放）")];
+
+    /// <summary>识别设备与释放策略。返回是否有改动。</summary>
+    private bool DrawDeviceSettings()
+    {
+        var changed = false;
+        ImGui.Text(Loc.T("识别设备"));
+        foreach (var (key, label, tip) in Devices)
+        {
+            ImGui.SameLine();
+            if (ImGui.RadioButton(Loc.T(label), _config.BackendDevice == key))
+            {
+                _config.BackendDevice = key;
+                changed = true;
+            }
+            ItemTip(Loc.T(tip));
+        }
+        ImGui.SetNextItemWidth(180);
+        var current = ReleasePolicies.FirstOrDefault(p => p.Seconds == _config.ReleaseAfter).Label is { } known
+            ? Loc.T(known) : Loc.F("空闲 {0} 秒后释放", _config.ReleaseAfter);
+        if (ImGui.BeginCombo(Loc.T("模型释放"), current))
+        {
+            foreach (var (seconds, label) in ReleasePolicies)
+                if (ImGui.Selectable(Loc.T(label), _config.ReleaseAfter == seconds))
+                {
+                    _config.ReleaseAfter = seconds;
+                    changed = true;
+                }
+            ImGui.EndCombo();
+        }
+        ItemTip(Loc.T("释放后显存/内存归还给游戏，下次识别重新加载（约 5~10 秒）。\nGPU 模式用过一次后，CUDA 运行时会常驻少量显存，直到后端退出"));
+        using (ImRaii.Disabled(_config.BackendDevice == "cpu"))
+            changed |= Check(Loc.T("GPU 模式下 MHR 放 CPU"), _config.MhrOnCpu, v => _config.MhrOnCpu = v, Loc.T("显存约省 750MB，结果一致，每张约慢 0.5 秒"));
+        return changed;
+    }
+
+    private static bool Check(string label, bool value, Action<bool> set, string? tip = null)
+    {
+        var v = value;
+        var changed = ImGui.Checkbox(label, ref v);
+        if (tip is not null) ItemTip(tip);
+        if (changed) set(v);
+        return changed;
+    }
+}
