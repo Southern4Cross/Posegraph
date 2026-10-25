@@ -37,6 +37,15 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
 
     public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));
 
+    /// <summary>清除 Brio 姿势栈（保留模型位置），等几帧让 Brio 读到的骨骼刷新。</summary>
+    public async Task<bool> ResetPoseAsync(int? actor)
+    {
+        var ok = await framework.RunOnFrameworkThread(() =>
+            clientState.IsGPosing && Resolve(actor) is { } a && brio.ResetPoseKeepTransform(a));
+        if (ok) await framework.DelayTicks(FreezeSettleTicks);
+        return ok;
+    }
+
     /// <summary>冻结动画、等几帧再导入（否则待机动画会让姿势漂移），之后再应用一次。返回错误信息，成功为 null。</summary>
     public async Task<string?> ApplyAsync(int? actor, string poseJson)
     {

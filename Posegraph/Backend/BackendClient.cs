@@ -52,10 +52,11 @@ public sealed class BackendClient(Func<int> port) : IDisposable
 
     public Task<byte[]> SessionImageAsync(string sid) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"));
 
-    public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race)
+    public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race,
+                                                    bool trustReference = false)
     {
         using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/retarget"),
-            new { person, @params = p, reference, race, overlay = true, stick = true }, Json);
+            new { person, @params = p, reference, race, overlay = true, stick = true, trust_reference = trustReference }, Json);
         return (await ReadAsync<RetargetResult>(resp))!;
     }
 

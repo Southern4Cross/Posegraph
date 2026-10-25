@@ -92,6 +92,31 @@ def guess_race(reference) -> tuple[str, float]:
     return best, best_err
 
 
+# 残留姿势检测用的骨段（四肢、脊柱、颈）
+_LENGTH_SEGMENTS = [("j_ude_a_l", "j_ude_b_l"), ("j_ude_b_l", "j_te_l"), ("j_asi_a_l", "j_asi_b_l"),
+                    ("j_asi_b_l", "j_asi_c_l"), ("j_asi_c_l", "j_asi_d_l"), ("j_sebo_b", "j_sebo_c"),
+                    ("j_sebo_c", "j_kubi"), ("j_kubi", "j_kao")]
+STALE_DEVIATION = 0.10
+
+
+def length_deviation(reference, code: str) -> float | None:
+    """游戏骨长与该骨架绑定骨长的最大相对偏差（先去掉整体比例）。正常角色在 3% 以内；
+    换种族后残留的 Brio 姿势栈（按旧骨架算的位置增量）会让它明显变大。缺骨骼时返回 None。"""
+    from .ffxiv import forward_kinematics, load_ffxiv_skeleton
+
+    try:
+        ref = np.array([np.linalg.norm(reference.get(b).position - reference.get(a).position) for a, b in _LENGTH_SEGMENTS])
+    except AttributeError:
+        return None
+    sk = load_ffxiv_skeleton(code)
+    _, P = forward_kinematics(sk)
+    bind = np.array([np.linalg.norm(P[sk.index(b)] - P[sk.index(a)]) for a, b in _LENGTH_SEGMENTS])
+    if (ref < 1e-6).any():
+        return float("inf")
+    lr = np.log(ref / bind)
+    return float(np.exp(np.abs(lr - np.median(lr)).max()) - 1)
+
+
 def describe(code: str) -> dict:
     info = RACES.get(code)
     if info is None:
