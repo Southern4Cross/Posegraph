@@ -4,5 +4,6 @@
   "Punchline": "Turn a photo or illustration into a Brio pose.",
   "Description": "Recognizes the human pose in a photo or illustration with a local AI backend (SAM 3D Body) and applies it to your GPose actor through Brio. Supports all playable races, camera matching, tuning sliders and .pose export. Requires Brio and the Posegraph backend package.\n\n从照片或插画识别人物姿势，经本地 AI 后端（SAM 3D Body）转换后通过 Brio 应用到 GPose 角色。需要 Brio 与 Posegraph 后端一键包。",
   "Tags": [ "gpose", "brio", "pose", "ai", "photo" ],
-  "RepoUrl": "https://github.com/extrant/Posegraph"
+  "RepoUrl": "https://github.com/extrant/Posegraph",
+  "IconUrl": "https://raw.githubusercontent.com/extrant/Posegraph/main/Posegraph/images/icon.png"
 }

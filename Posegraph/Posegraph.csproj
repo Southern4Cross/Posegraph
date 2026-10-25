@@ -20,6 +20,7 @@
 	<!-- 许可证随插件一起发布（DalamudPackager 会把输出目录里的文件打进 latest.zip） -->
 	<ItemGroup>
 		<None Include="..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+		<None Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>
