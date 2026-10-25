@@ -139,6 +139,7 @@ public static partial class Loc
         ["自动（{0}）"] = "Auto ({0})",
         ["按骨长推断"] = "inferred from bone lengths",
         ["（未实测）"] = " (untested)",
+        ["（未适配）"] = " (not supported yet)",
         ["按角色外貌识别"] = "detected from character appearance",
         ["手动指定"] = "set manually",
         ["按游戏内骨长推断"] = "inferred from in-game bone lengths",

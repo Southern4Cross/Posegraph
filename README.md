@@ -21,8 +21,9 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 - **Photo and illustration support**, full or half body, fingers included. An *Illustration* preset tones down
   the exaggerated head/neck proportions of drawn art.
-- **All playable races.** The race is read from the character's appearance (or chosen manually); 18 IVCS
-  skeletons are included. Midlander ♂ is verified in game; the others are marked *untested* in the UI.
+- **All playable male races.** The race is read from the character's appearance (or chosen manually).
+  Midlander ♂ is verified in game; the other male races are marked *untested* in the UI.
+  Female skeletons are **not supported yet** (their data is included, but the retargeting rules are tuned for male skeletons).
 - **Live tuning without re-running the AI**: per-region amplitude (spine, neck, head, clavicle, wrist), hand contact
   compensation, gravity correction, ground snapping, helper-bone strength, and manual per-joint offsets in a 3D stick figure.
   Dragging a slider updates the preview; releasing it applies the pose (Brio's undo history stays clean).
@@ -94,7 +95,7 @@ Status bar icons, left to right: Brio, GPose, backend, VRAM, RAM; hover for deta
 | Elezen ♂ | Elezen | untested |
 | Roegadyn-type ♂ | Roegadyn, Hrothgar | untested |
 | Lalafell | Lalafell ♂ / ♀ | untested |
-| Female skeletons | all | untested |
+| Female skeletons | all | **not supported yet** |
 
 If the detected race is wrong (race-changing mods, Customize+ scaling), choose it manually in the race list next to the actor list.
 

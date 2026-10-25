@@ -610,7 +610,7 @@ public sealed class MainWindow : Window, IDisposable
                     ImGui.TextDisabled(Loc.T(r.Group));
                     group = r.Group;
                 }
-                if (ImGui.Selectable(Loc.F("  {0}{1}##{2}", Loc.T(r.Name), (r.Validated ? "" : Loc.T("（未实测）")), r.Code), _raceOverride == r.Code))
+                if (ImGui.Selectable(Loc.F("  {0}{1}##{2}", Loc.T(r.Name), !r.Supported ? Loc.T("（未适配）") : r.Validated ? "" : Loc.T("（未实测）"), r.Code), _raceOverride == r.Code))
                     SelectRace(r.Code);
             }
             ImGui.EndCombo();

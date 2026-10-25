@@ -20,6 +20,11 @@ class RaceInfo:
     group: str          # 绑定姿势相同（只差耳朵等不写入的骨骼）的骨架归为一组
     validated: bool     # 游戏内实测过
 
+    @property
+    def supported(self) -> bool:
+        """女性骨架尚未适配：重定向规则（辅助骨、合理性阈值、手部补偿尺寸）都是按男性骨架调校的。"""
+        return self.male
+
 
 def _r(code, name, male, group, validated=False):
     return RaceInfo(code, name, male, group, validated)
@@ -90,5 +95,6 @@ def guess_race(reference) -> tuple[str, float]:
 def describe(code: str) -> dict:
     info = RACES.get(code)
     if info is None:
-        return {"code": code, "name": code, "group": "", "validated": False, "known": False}
-    return {"code": code, "name": info.name, "group": info.group, "validated": info.validated, "known": True}
+        return {"code": code, "name": code, "group": "", "validated": False, "supported": False, "known": False}
+    return {"code": code, "name": info.name, "group": info.group, "validated": info.validated,
+            "supported": info.supported, "known": True}

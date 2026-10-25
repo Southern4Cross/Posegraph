@@ -54,6 +54,7 @@ EN = {
     "无法确定种族，按人族中原男计算": "Could not determine the race; using Midlander Hyur (M)",
     "（没有 {code} 的骨架数据）": " (no skeleton data for {code})",
     "{name}尚未在游戏内实测，结果仅供参考": "{name} has not been tested in game yet; results may be off",
+    "{name}尚未适配（目前只适配男性骨架），姿势可能明显不对": "{name} is not supported yet (only male skeletons are); the pose may be clearly wrong",
     # 设备
     "手动指定": "set manually",
     "未检测到 NVIDIA 显卡": "no NVIDIA GPU detected",

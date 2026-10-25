@@ -291,7 +291,9 @@ def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
         warnings.append(tr("无法确定种族，按人族中原男计算") + (tr("（没有 {code} 的骨架数据）", code=requested) if requested else ""))
     info = races.describe(code)
     info.update(name=tr(info["name"]), group=tr(info["group"]))
-    if not info["validated"]:
+    if not info["supported"]:
+        warnings.append(tr("{name}尚未适配（目前只适配男性骨架），姿势可能明显不对", name=info["name"]))
+    elif not info["validated"]:
         warnings.append(tr("{name}尚未在游戏内实测，结果仅供参考", name=info["name"]))
     return {**info, "source": source, "warnings": warnings}
 
