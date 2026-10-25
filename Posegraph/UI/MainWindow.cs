@@ -95,6 +95,8 @@ public sealed class MainWindow : Window, IDisposable
     private int? _pushedIndex;             // 应用过姿势的角色：外貌变化重算后自动再应用
     private string? _pushStatus;           // 下一次应用成功时显示的状态（代替"已应用到角色"）
     private readonly Dictionary<string, string> _backups = new();   // 身份 → 第一次应用前的姿势
+    private bool _resetPending;                                     // 换了种族：下次应用前先清除 Brio 残留姿势
+    private readonly HashSet<string> _cleanSignatures = new();      // 已清除过 Brio 姿势的身份：骨长不符也信游戏值
 
     // 3D 视图
     private float _yaw, _pitch = 0.15f, _zoom = 1f;
@@ -218,6 +220,7 @@ public sealed class MainWindow : Window, IDisposable
             _pendingSignature = null;
             _currentSignature = id.Signature;
             var raceChanged = id.Race != _detectedRace;
+            if (raceChanged) _resetPending = true;   // 旧骨架的姿势增量会叠加到新骨架上
             _reference = null;
             _detectedRace = id.Race;
             if (_session is not null)
@@ -521,9 +524,23 @@ public sealed class MainWindow : Window, IDisposable
                 var push = _rtPush;
                 _rtPush = false;
                 var session = _session!;
+                if (push && _resetPending)
+                {
+                    _resetPending = false;
+                    await ClearBrioPoseAsync();
+                }
                 var reference = await ReferenceAsync();
-                var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference, _raceOverride ?? _detectedRace);
+                var trust = _referenceSignature is { } sig && _cleanSignatures.Contains(sig);
+                var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
+                                                         _raceOverride ?? _detectedRace, trust);
                 if (session != _session) continue;
+                // 游戏骨长不对（换种族前残留的 Brio 姿势）：先清除再算一次；清除后仍不符就是 Customize+ / 改体型 MOD
+                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync())
+                {
+                    _rtPush = true;
+                    _rtDirty = true;
+                    continue;
+                }
                 _result = result;
                 if (push) await PushAsync(result.Pose);
             } while (_rtDirty || _rtPush);
@@ -536,6 +553,20 @@ public sealed class MainWindow : Window, IDisposable
         {
             _rtBusy = false;
         }
+    }
+
+    /// <summary>清除 Brio 姿势栈后重新读取参考姿势；这个身份之后的骨长按游戏实际值计算。</summary>
+    private async Task<bool> ClearBrioPoseAsync()
+    {
+        if (!await _applier.ResetPoseAsync(_actor)) return false;
+        _reference = null;
+        if (await _applier.IdentifyAsync(_actor) is { } id)
+        {
+            _cleanSignatures.Add(id.Signature);
+            _backups.Remove(id.Signature);   // 清除前读到的是残留的错误姿势，不能拿来还原
+        }
+        _pushStatus ??= Loc.T("已清除换种族前残留的 Brio 姿势并重新应用");
+        return true;
     }
 
     /// <summary>游戏内角色当前姿势：骨长/缩放按游戏实际值（种族、Customize+）。每个角色取一次并留作还原备份。</summary>
@@ -574,7 +605,8 @@ public sealed class MainWindow : Window, IDisposable
 
     private void ApplyNow()
     {
-        if (_result is { } r) _ = Run(() => PushAsync(r.Pose));
+        // 结果是按残留姿势算的、或刚换过种族：重新计算（会先清除 Brio 残留姿势）
+        if (_result is { ReferenceStale: false } r && !_resetPending) _ = Run(() => PushAsync(r.Pose));
         else RequestRetarget(true);
     }
 
@@ -748,6 +780,7 @@ public sealed class MainWindow : Window, IDisposable
         _referenceSignature = null;
         _pendingSignature = null;
         _pushedIndex = null;
+        _resetPending = false;
         _detectedRace = null;
         _lastActors = DateTime.MinValue;
         RequestRetarget(false);

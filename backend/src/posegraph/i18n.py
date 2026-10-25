@@ -51,6 +51,10 @@ EN = {
     "游戏角色的骨长更像{group}，与所选{name}不符（刚换过种族？改体型 MOD？），身体比例会不对":
         "The actor's bone lengths look like {group}, not the selected {name} (race just changed? body mod?); proportions will be off",
     "没有 {code} 的骨架数据，按骨长推断为{group}": "No skeleton data for {code}; inferred {group} from bone lengths",
+    "游戏骨长与{name}相差 {pct}%（Customize+ 或改体型 MOD？），按游戏实际骨长计算":
+        "Game bone lengths differ from {name} by {pct}% (Customize+ or a body mod?); using the game lengths",
+    "游戏骨长与{name}相差 {pct}%，多半是换种族前残留的 Brio 姿势，已改用{name}的标准骨长":
+        "Game bone lengths differ from {name} by {pct}%, most likely a Brio pose left over from before a race change; using standard {name} lengths",
     "无法确定种族，按人族中原男计算": "Could not determine the race; using Midlander Hyur (M)",
     "（没有 {code} 的骨架数据）": " (no skeleton data for {code})",
     "{name}尚未适配（目前只适配男性骨架），姿势可能明显不对": "{name} is not supported yet (only male skeletons are); the pose may be clearly wrong",

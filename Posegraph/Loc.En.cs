@@ -283,6 +283,7 @@ public static partial class Loc
         ["检测到角色种族变化（{0}），已重新计算"] = "Actor race changed ({0}), recalculated",
         ["检测到角色外貌变化，已重新计算"] = "Actor appearance changed, recalculated",
         ["并应用"] = " and applied",
+        ["已清除换种族前残留的 Brio 姿势并重新应用"] = "Cleared the Brio pose left over from before the race change and applied again",
         ["自动打开的界面在退出 GPose 时自动关闭；用指令或插件列表打开的不会关闭"] = "A window opened automatically closes when you leave GPose; one opened with the command or from the plugin list stays open",
         ["游戏界面隐藏时仍显示"] = "Show while the game UI is hidden",
         ["关闭时与游戏界面一起隐藏（如 GPose 里隐藏界面截图）。界面不显示时可以打开试试"] = "When off, the window hides together with the game UI (e.g. hiding the UI in GPose for screenshots). Try turning this on if the window does not show up",

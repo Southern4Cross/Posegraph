@@ -48,8 +48,9 @@ PRESETS: dict[str, RetargetParams] = {
 
 
 def run(human: dict, image_size: tuple[int, int], params: RetargetParams,
-        reference: BrioPose | None = None, race: str = DEFAULT_RACE) -> RetargetResult:
-    """human：会话里保存的单人识别结果（键同 image_to_pose 的 npz）；race：骨架编号（见 retarget/races.py）。"""
+        reference: BrioPose | None = None, race: str = DEFAULT_RACE, reference_lengths: bool = True) -> RetargetResult:
+    """human：会话里保存的单人识别结果（键同 image_to_pose 的 npz）；race：骨架编号（见 retarget/races.py）；
+    reference_lengths：False 时骨长用该骨架的绑定骨长（游戏骨长不可信时）。"""
     amp = {bone: k for group, k in params.amplitude.items() for bone in AMPLITUDE_GROUPS.get(group, ())}
     return retarget(human["joint_global_rots"], human["joint_coords"], human["rest_joint_coords"],
                     human["rest_joint_rots"], reference=reference, race=race, vertices_cam=human.get("vertices"),
@@ -58,7 +59,7 @@ def run(human: dict, image_size: tuple[int, int], params: RetargetParams,
                     upright=params.upright, upright_max_deg=params.upright_max_deg, ground=params.ground,
                     amplitude=amp, offsets={k: tuple(v) for k, v in params.offsets.items()},
                     hand_strength=params.hand_strength, hand_near=params.hand_near, hand_far=params.hand_far,
-                    helper_strength=params.helper_strength)
+                    helper_strength=params.helper_strength, reference_lengths=reference_lengths)
 
 
 # ---------------------------------------------------------------- 合理性检查
