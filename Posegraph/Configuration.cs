@@ -50,8 +50,11 @@ public class Configuration : IPluginConfiguration
     /// <summary>松开滑杆时自动应用到角色（拖动中只更新预览）。</summary>
     public bool PushOnRelease { get; set; } = true;
 
-    /// <summary>进入 GPose 且 Brio 就绪时自动打开主界面。</summary>
+    /// <summary>进入 GPose 且 Brio 就绪时自动打开主界面（自动打开的在退出 GPose 时关闭）。</summary>
     public bool AutoOpenInGpose { get; set; } = true;
+
+    /// <summary>游戏界面隐藏时仍显示（默认与 Brio 一致：跟随游戏界面隐藏）。</summary>
+    public bool ShowWhenUiHidden { get; set; }
 
     /// <summary>新图识别完成后立即应用到角色。</summary>
     public bool PushAfterRecognize { get; set; }

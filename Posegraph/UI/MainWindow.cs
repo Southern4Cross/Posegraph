@@ -1347,7 +1347,13 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.TextDisabled(Loc.T("操作"));
         changed |= Check(Loc.T("松开滑杆时自动应用到角色"), _config.PushOnRelease, v => _config.PushOnRelease = v);
         changed |= Check(Loc.T("识别完成后立即应用到角色"), _config.PushAfterRecognize, v => _config.PushAfterRecognize = v);
-        changed |= Check(Loc.T("进入 GPose 且 Brio 就绪时自动打开界面"), _config.AutoOpenInGpose, v => _config.AutoOpenInGpose = v);
+        changed |= Check(Loc.T("进入 GPose 且 Brio 就绪时自动打开界面"), _config.AutoOpenInGpose, v => _config.AutoOpenInGpose = v,
+                         Loc.T("自动打开的界面在退出 GPose 时自动关闭；用指令或插件列表打开的不会关闭"));
+        changed |= Check(Loc.T("游戏界面隐藏时仍显示"), _config.ShowWhenUiHidden, v =>
+        {
+            _config.ShowWhenUiHidden = v;
+            Plugin.ApplyUiHide(_pi, _config);
+        }, Loc.T("关闭时与游戏界面一起隐藏（如 GPose 里隐藏界面截图）。界面不显示时可以打开试试"));
 
         ImGui.Separator();
         ImGui.TextDisabled(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))));
