@@ -1,4 +1,6 @@
 using System.Numerics;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Components;
@@ -18,7 +20,7 @@ namespace Posegraph.UI;
 /// 主界面：状态栏 → 选图识别 → 图像叠加 / 3D 火柴人 / 调整 / 提示 / 设置 → 应用、镜头、还原、导出。
 /// 识别只做一次（后端缓存），调参只重跑重定向；拖动滑杆时只刷新预览，松手才应用到角色（Brio 撤销历史保持干净）。
 /// </summary>
-public sealed class MainWindow : Window, IDisposable
+public sealed partial class MainWindow : Window, IDisposable
 {
     private static readonly Vector4 Green = new(0.35f, 0.85f, 0.4f, 1);
     private static readonly Vector4 Yellow = new(1f, 0.8f, 0.25f, 1);
@@ -44,6 +46,7 @@ public sealed class MainWindow : Window, IDisposable
     private readonly IDalamudPluginInterface _pi;
     private readonly IClientState _clientState;
     private readonly ITextureProvider _textures;
+    private readonly ITextureReadbackProvider _textureReadback;
     private readonly IDragDropManager _dragDrop;
     private readonly BrioBridge _brio;
     private readonly PoseApplier _applier;
@@ -68,9 +71,7 @@ public sealed class MainWindow : Window, IDisposable
 
     // 会话
     private SessionInfo? _session;
-    private string? _imagePath;
     private IDalamudTextureWrap? _texture;
-    private IDalamudTextureWrap? _newTexture;
     private int _person;
     private RetargetParams _params;
     private bool _paramsDirty;       // 参数可能变了：松手后与已保存的比较，不同就写入配置
@@ -79,8 +80,30 @@ public sealed class MainWindow : Window, IDisposable
     private volatile RetargetResult? _result;
     private volatile bool _recognizing;
 
+    // 对话结果在 Draw 中接收，避免后台线程与 ImGui 同时改动聊天记录。
+    private string _chatPrompt = "";
+    private string _chatApiKey = "";
+    private string? _chatError;
+    private PoseChatMessage[] _chatHistory = [];
+    private Task<PoseChatResponse>? _chatTask;
+    private CancellationTokenSource? _chatCts;
+    private int _chatRevision, _chatRequestRevision;
+    private bool _chatPoseActive, _chatFreshStart, _chatImageDetached, _chatGround = true;
+    private string _chatSentPrompt = "";
+    private readonly HashSet<string> _chatPendingBones = new(StringComparer.Ordinal);
+    private volatile string? _lastAppliedPreviewPose;
+    private bool _chatRequestFullBase;
+    private readonly ModelCatalogClient _modelCatalog = new();
+    private string[] _chatModels = [];
+    private Task<string[]>? _modelsTask;
+    private CancellationTokenSource? _modelsCts;
+    private int _modelsRevision, _modelsRequestRevision;
+    private string _modelsRequestEndpoint = "";
+    private string? _modelsError;
+
     // 重定向请求合并：忙时只记"还需要再算一次"
     private volatile bool _rtBusy, _rtDirty, _rtPush;
+    private int _previewOnlyRevision;
 
     // 角色
     private int? _actor;
@@ -111,8 +134,10 @@ public sealed class MainWindow : Window, IDisposable
     private string _statusText = Loc.T("就绪");
     private Vector4 _statusColor = Grey;
     private int? _selectTab;
+    private int? _drawSelectTab;
 
     public MainWindow(Configuration config, IDalamudPluginInterface pi, IClientState clientState, ITextureProvider textures,
+                      ITextureReadbackProvider textureReadback,
                       IDragDropManager dragDrop, BrioBridge brio, PoseApplier applier, BridgeServer server)
         : base("Posegraph###PosegraphMain")
     {
@@ -120,6 +145,7 @@ public sealed class MainWindow : Window, IDisposable
         _pi = pi;
         _clientState = clientState;
         _textures = textures;
+        _textureReadback = textureReadback;
         _dragDrop = dragDrop;
         _brio = brio;
         _applier = applier;
@@ -129,6 +155,10 @@ public sealed class MainWindow : Window, IDisposable
         _preset = config.DefaultPreset;
         _params = LoadParams(_preset);
         _savedParams = ParamsSnapshot(_params);
+        try { _chatApiKey = ApiKeyProtection.Unprotect(config.ChatApiKeyProtected); }
+        catch { _chatError = Loc.T("无法解密已保存的 API 密钥，请在设置中重新输入"); }
+        if (config.ChatModelsEndpoint == config.ChatApiEndpoint.Trim())
+            _chatModels = (config.ChatModels ?? []).Where(m => !string.IsNullOrWhiteSpace(m)).Distinct().ToArray();
 
         Size = new Vector2(420, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -150,13 +180,22 @@ public sealed class MainWindow : Window, IDisposable
 
     public void Dispose()
     {
+        DisposeAdvice();
+        _chatCts?.Cancel();
+        _chatCts?.Dispose();
+        if (_chatTask is { } chat)
+            _ = chat.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        _modelsCts?.Cancel();
+        _modelsCts?.Dispose();
+        if (_modelsTask is { } models)
+            _ = models.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        _modelCatalog.Dispose();
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
-        _client.Dispose();
+        DisposeImages();   // finishes cache cleanup before disposing the HTTP client
         _updater.Dispose();
         _texture?.Dispose();
-        _newTexture?.Dispose();
     }
 
     private void SetStatus(string text, Vector4? color = null)
@@ -223,6 +262,13 @@ public sealed class MainWindow : Window, IDisposable
             SwitchActor(id);
             return;
         }
+        if (_currentSignature is not null && _currentSignature != id.Signature &&
+            (_chatPoseActive || _chatTask is not null || _chatHistory.Length > 0))
+        {
+            _resetPending |= id.Race != _detectedRace;
+            ResetChatContext(discardPose: true);
+            if (_session is not null) RequestRetarget(false);
+        }
         // 同一个角色外貌变了（Glamourer 换种族 / 体型）：丢弃参考姿势，重新计算
         if (_reference is not null && _referenceSignature != id.Signature)
         {
@@ -238,6 +284,7 @@ public sealed class MainWindow : Window, IDisposable
             if (raceChanged) _resetPending = true;   // 旧骨架的姿势增量会叠加到新骨架上
             _reference = null;
             _detectedRace = id.Race;
+            ResetChatContext(discardPose: true);
             if (_session is not null)
             {
                 var push = _pushedIndex == id.Index;
@@ -261,6 +308,7 @@ public sealed class MainWindow : Window, IDisposable
     /// </summary>
     private void SwitchActor(PoseApplier.ActorIdentity id)
     {
+        ResetChatContext(discardPose: true);
         SaveActorState();
         var switched = _actorKey is not null;
         _actorKey = id.Key;
@@ -289,6 +337,7 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>退出 GPose：角色都没了，下次进 GPose 会重新分配 ObjectIndex，按角色记的状态全部作废。</summary>
     private void ForgetActors()
     {
+        ResetChatContext(discardPose: true);
         _actorStates.Clear();
         _backups.Clear();
         _cleanSignatures.Clear();
@@ -499,45 +548,6 @@ public sealed class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ 识别与重定向
 
-    private void Recognize(string path)
-    {
-        if (_recognizing) return;
-        if (!BackendOnline)
-        {
-            SetError(Loc.T("后端离线：先点右上角电源按钮启动"));
-            return;
-        }
-        _recognizing = true;
-        _imagePath = path;
-        SetStatus(ModelReady ? Loc.T("识别中…") : Loc.T("加载模型并识别中（约 10~20 秒）…"), Yellow);
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var bytes = await File.ReadAllBytesAsync(path);
-                var info = await _client.CreateSessionAsync(bytes, Path.GetFileNameWithoutExtension(path));
-                var png = await _client.SessionImageAsync(info.SessionId);
-                var tex = await _textures.CreateFromImageAsync(png);
-                Interlocked.Exchange(ref _newTexture, tex)?.Dispose();
-                _session = info;
-                _person = 0;
-                _result = null;
-                _params.Offsets.Clear();   // 手动偏移只对当前图有意义
-                _selected = null;
-                SetStatus(Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f), Green);
-                RequestRetarget(_config.PushAfterRecognize);
-            }
-            catch (Exception ex)
-            {
-                SetError(Loc.F("识别失败：{0}", ex.Message));
-            }
-            finally
-            {
-                _recognizing = false;
-            }
-        });
-    }
-
     /// <summary>预设的值：有保存过的用保存的，否则用内置预设。</summary>
     private RetargetParams LoadParams(string preset)
     {
@@ -571,7 +581,7 @@ public sealed class MainWindow : Window, IDisposable
     private void RequestRetarget(bool push)
     {
         _paramsDirty = true;
-        if (_session is null) return;
+        if (_session is null || _chatPoseActive || _chatTask is not null) return;
         _rtPush |= push;
         if (_rtBusy)
         {
@@ -584,49 +594,60 @@ public sealed class MainWindow : Window, IDisposable
 
     private async Task RetargetLoop()
     {
+        var activeRevision = Volatile.Read(ref _previewOnlyRevision);
         try
         {
             do
             {
+                if (_chatPoseActive || _chatTask is not null || _session is not { } session) break;
+                var previewOnlyRevision = Volatile.Read(ref _previewOnlyRevision);
+                activeRevision = previewOnlyRevision;
+                var ct = _imagePoseToken;
                 _rtDirty = false;
                 var push = _rtPush;
                 _rtPush = false;
-                var session = _session!;
                 if (push && _resetPending)
                 {
                     _resetPending = false;
-                    await ClearBrioPoseAsync();
+                    await ClearBrioPoseAsync(ct);
                 }
                 var reference = await ReferenceAsync();
+                if (session != _session || previewOnlyRevision != Volatile.Read(ref _previewOnlyRevision)) continue;
                 var trust = _referenceSignature is { } sig && _cleanSignatures.Contains(sig);
                 var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
                                                          _raceOverride ?? _detectedRace, trust);
-                if (session != _session) continue;
+                if (session != _session || previewOnlyRevision != Volatile.Read(ref _previewOnlyRevision) ||
+                    _chatPoseActive || _chatTask is not null) continue;
                 // 游戏骨长不对（换种族前残留的 Brio 姿势）：先清除再算一次；清除后仍不符就是 Customize+ / 改体型 MOD
-                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync())
+                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync(ct))
                 {
                     _rtPush = true;
                     _rtDirty = true;
                     continue;
                 }
                 _result = result;
-                if (push) await PushAsync(result.Pose);
+                if (push) await PushAsync(result.Pose, _actor, ct);
             } while (_rtDirty || _rtPush);
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            SetError(Loc.F("重定向失败：{0}", ex.Message));
+            if (activeRevision == Volatile.Read(ref _previewOnlyRevision))
+                SetError(Loc.F("重定向失败：{0}", ex.Message));
         }
         finally
         {
             _rtBusy = false;
+            if ((_rtDirty || _rtPush) && _session is not null && !_imageLifetime.IsCancellationRequested)
+                RequestRetarget(false);
         }
     }
 
     /// <summary>清除 Brio 姿势栈后重新读取参考姿势；这个身份之后的骨长按游戏实际值计算。</summary>
-    private async Task<bool> ClearBrioPoseAsync()
+    private async Task<bool> ClearBrioPoseAsync(CancellationToken ct = default)
     {
-        if (!await _applier.ResetPoseAsync(_actor)) return false;
+        if (!await _applier.ResetPoseAsync(_actor, ct)) return false;
+        ct.ThrowIfCancellationRequested();
         _reference = null;
         if (await _applier.IdentifyAsync(_actor) is { } id)
         {
@@ -653,7 +674,10 @@ public sealed class MainWindow : Window, IDisposable
         return pose;
     }
 
-    private async Task PushAsync(string pose)
+    private Task PushAsync(string pose) => PushAsync(pose, _actor);
+
+    private async Task PushAsync(string pose, int? actor, CancellationToken ct = default, bool freeze = true,
+                                 string? previewPose = null)
     {
         if (!_clientState.IsGPosing)
         {
@@ -662,10 +686,17 @@ public sealed class MainWindow : Window, IDisposable
         }
         var status = _pushStatus ?? Loc.T("已应用到角色");
         _pushStatus = null;
-        var error = await _applier.ApplyAsync(_actor, pose);
+        string? error;
+        try
+        {
+            error = await _applier.ApplyAsync(actor, pose, ct, freeze);
+            ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         if (error is null)
         {
-            _pushedIndex = (await _applier.IdentifyAsync(_actor))?.Index;
+            _lastAppliedPreviewPose = previewPose ?? pose;
+            _pushedIndex = (await _applier.IdentifyAsync(actor))?.Index;
             SetStatus(status, Green);
         }
         else SetError(error);
@@ -673,8 +704,45 @@ public sealed class MainWindow : Window, IDisposable
 
     private void ApplyNow()
     {
+        if (_chatPoseActive && _result is { } chatResult)
+        {
+            var revision = _chatRevision;
+            var identity = _applier.Identify(_actor);
+            if (identity is null)
+            {
+                SetError(Loc.T("找不到角色（请在 GPose 中选中目标）"));
+                return;
+            }
+            _ = Run(async () =>
+            {
+                var currentIdentity = await _applier.IdentifyAsync(identity.Index);
+                if (revision != _chatRevision || currentIdentity?.Signature != identity.Signature) return;
+                if (_resetPending)
+                {
+                    var reset = await _applier.ResetPoseAsync(identity.Index);
+                    if (revision != _chatRevision) return;
+                    if (!reset) throw new InvalidOperationException(Loc.T("无法重置角色姿势，请检查 Brio"));
+                    _reference = null;
+                    _cleanSignatures.Add(identity.Signature);
+                    _backups.Remove(identity.Signature);
+                    _resetPending = false;
+                }
+                var reference = await _applier.GetPoseAsync(identity.Index);
+                currentIdentity = await _applier.IdentifyAsync(identity.Index);
+                if (revision != _chatRevision || _resetPending || currentIdentity?.Signature != identity.Signature) return;
+                // 纯文字生成也保存角色原姿势；固定 ObjectIndex，避免等待时切换目标后误应用。
+                if (reference is not null) _backups.TryAdd(identity.Signature, reference);
+                await PushAsync(chatResult.ApplyPose ?? chatResult.Pose, identity.Index, freeze: !chatResult.FacialOnly,
+                                previewPose: chatResult.Pose);
+            });
+            return;
+        }
         // 结果是按残留姿势算的、或刚换过种族：重新计算（会先清除 Brio 残留姿势）
-        if (_result is { ReferenceStale: false } r && !_resetPending) _ = Run(() => PushAsync(r.Pose));
+        if (_result is { ReferenceStale: false } r && !_resetPending)
+        {
+            var ct = _imagePoseToken;
+            _ = Run(() => PushAsync(r.Pose, _actor, ct));
+        }
         else RequestRetarget(true);
     }
 
@@ -735,21 +803,20 @@ public sealed class MainWindow : Window, IDisposable
             if (!ok || paths.Count == 0) return;
             _config.LastImageDir = Path.GetDirectoryName(paths[0]) ?? "";
             _pi.SavePluginConfig(_config);
-            Recognize(paths[0]);
-        }, 1, dir, true);
+            ImportImagePaths(paths);
+        }, 0, dir, true);
     }
 
     // ------------------------------------------------------------------ 绘制
 
     public override void Draw()
     {
-        if (Interlocked.Exchange(ref _newTexture, null) is { } tex)
-        {
-            _texture?.Dispose();
-            _texture = tex;
-        }
+        PollImages();
         PollHealth();
         RefreshActors();
+        PollChat();
+        PollAdvice();
+        PollModelCatalog();
         PersistParams();
         DragSource();
 
@@ -757,15 +824,19 @@ public sealed class MainWindow : Window, IDisposable
         DrawToolbar();
 
         var footer = ImGui.GetFrameHeightWithSpacing() + ImGui.GetTextLineHeightWithSpacing();
-        if (ImGui.BeginTabBar("##tabs"))
+        _drawSelectTab = _selectTab;
+        _selectTab = null;
+        // ImGui retains tab order across plugin hot reloads; use a new layout ID
+        // so existing sessions adopt the chat-before-settings order as well.
+        if (ImGui.BeginTabBar("##tabs-chat-before-settings-v2"))
         {
             Tab(0, Loc.T("图像"), DrawImageTab, footer);
             Tab(1, "3D", DrawStickTab, footer);
             Tab(2, Loc.T("调整"), DrawTuningTab, footer);
             var warnings = _result?.Warnings.Length ?? 0;
             Tab(3, warnings > 0 ? Loc.F("提示 ({0})###warn", warnings) : Loc.T("提示###warn"), DrawWarningsTab, footer);
+            Tab(5, Loc.T("对话"), DrawChatTab, footer);
             Tab(4, Loc.T("设置"), DrawSettingsTab, footer);
-            _selectTab = null;
             ImGui.EndTabBar();
         }
         DrawFooter();
@@ -774,7 +845,7 @@ public sealed class MainWindow : Window, IDisposable
 
     private void Tab(int index, string label, Action draw, float footer)
     {
-        if (!ImGui.BeginTabItem(label, _selectTab == index ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None)) return;
+        if (!ImGui.BeginTabItem(label, _drawSelectTab == index ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None)) return;
         using (var child = ImRaii.Child($"##tab{index}", new Vector2(0, -footer)))
             if (child) draw();
         ImGui.EndTabItem();
@@ -782,12 +853,15 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawToolbar()
     {
-        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（jpg/png/webp/bmp/gif/tiff/avif），也可以把图片拖到图像页"),
-                       !_recognizing))
-            OpenImageDialog();
+        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（支持多选）或文件夹，也可以拖到图像页"), !ImageImportBusy))
+            ImGui.OpenPopup("##imageImport");
+        DrawImageImportMenu();
         ImGui.SameLine();
-        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _imagePath is not null && !_recognizing))
-            Recognize(_imagePath!);
+        if (IconButton("##clipboard", FontAwesomeIcon.Clipboard, Loc.T("识别剪切板中的图像"), !ImageImportBusy))
+            ImportClipboardImage();
+        ImGui.SameLine();
+        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _selectedImage is not null && !ImageImportBusy))
+            RecognizeImageAgain(_selectedImage!);
         ImGui.SameLine();
 
         // 角色
@@ -815,6 +889,7 @@ public sealed class MainWindow : Window, IDisposable
                     if (ImGui.Selectable(Loc.F("第 {0} 人", i + 1), _person == i))
                     {
                         _person = i;
+                        ResetChatContext(discardPose: true);
                         RequestRetarget(false);
                     }
                 ImGui.EndCombo();
@@ -844,6 +919,7 @@ public sealed class MainWindow : Window, IDisposable
     /// <summary>下一帧刷新角色时按新角色切换状态并重新计算（见 SwitchActor）。</summary>
     private void SelectActor(int? index)
     {
+        ResetChatContext(discardPose: true);
         _actor = index;
         _lastActors = DateTime.MinValue;
     }
@@ -891,6 +967,7 @@ public sealed class MainWindow : Window, IDisposable
 
     private void SelectRace(string? code)
     {
+        ResetChatContext(discardPose: true);
         _raceOverride = code;
         RequestRetarget(_config.PushOnRelease);
     }
@@ -898,10 +975,10 @@ public sealed class MainWindow : Window, IDisposable
     private void DrawFooter()
     {
         var hasResult = _result is not null;
-        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing))
+        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing && _chatTask is null && _imageLoadTask is null && !_rtBusy))
             ApplyNow();
         ImGui.SameLine();
-        if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing))
+        if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing && !_chatPoseActive && _chatTask is null))
             ReplicateCamera();
         ImGui.SameLine();
         if (IconButton("##restore", FontAwesomeIcon.Undo, Loc.T("还原为第一次应用前的姿势"), _currentSignature is not null && _backups.ContainsKey(_currentSignature) && _clientState.IsGPosing))
@@ -926,10 +1003,30 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawImageTab()
     {
+        if (_images.Count <= 1)
+        {
+            DrawImagePreview();
+            return;
+        }
+        var avail = ImGui.GetContentRegionAvail();
+        var width = Math.Min(190 * ImGuiHelpers.GlobalScale, avail.X * 0.42f);
+        using (var list = ImRaii.Child("##imageList", new Vector2(width, 0), true))
+            if (list) DrawImageList();
+        ImGui.SameLine();
+        using (var preview = ImRaii.Child("##imagePreview", new Vector2(0, 0)))
+            if (preview) DrawImagePreview();
+    }
+
+    private void DrawImagePreview()
+    {
         var showMhr = _config.ShowMhrOverlay;
         var showFf = _config.ShowFfxivOverlay;
+        var overlayRowWidth = ImGui.CalcTextSize(Loc.T("识别骨架（绿）")).X
+            + ImGui.CalcTextSize(Loc.T("FF14 骨架（橙）")).X
+            + ImGui.GetFrameHeight() * 2 + ImGui.GetStyle().ItemSpacing.X * 3;
+        var sameRow = ImGui.GetContentRegionAvail().X >= overlayRowWidth;
         var toggled = ImGui.Checkbox(Loc.T("识别骨架（绿）"), ref showMhr);
-        ImGui.SameLine();
+        if (sameRow) ImGui.SameLine();
         toggled |= ImGui.Checkbox(Loc.T("FF14 骨架（橙）"), ref showFf);
         if (toggled)
         {
@@ -941,13 +1038,18 @@ public sealed class MainWindow : Window, IDisposable
         var avail = ImGui.GetContentRegionAvail();
         if (_texture is null || _session is null)
         {
-            ImGui.Button(_recognizing ? Loc.T("识别中…") : Loc.T("点左上角文件夹选图\n或把图片拖到这里"), new Vector2(avail.X, Math.Max(80, avail.Y)));
+            var message = _imageLoadTask is not null ? Loc.T("加载所选图片中…")
+                : _recognizing && _images.Any(i => i.Session is not null) ? Loc.T("从左侧选择已识别的图片以预览和应用")
+                : _recognizing ? Loc.T("正在预识别全部图片…")
+                : _images.Count > 1 ? Loc.T("从左侧列表选择图片以加载预览")
+                : Loc.T("点左上角文件夹选图\n或把图片拖到这里");
+            ImGui.Button(message, new Vector2(avail.X, Math.Max(80, avail.Y)));
             DropTarget();
             return;
         }
         var imgW = _session.ImageSize[0];
         var imgH = _session.ImageSize[1];
-        var scale = Math.Min(avail.X / imgW, avail.Y / imgH);
+        var scale = Math.Min(Math.Max(1, avail.X) / imgW, Math.Max(1, avail.Y) / imgH);
         var size = new Vector2(imgW, imgH) * scale;
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail.X - size.X) / 2);
         var origin = ImGui.GetCursorScreenPos();
@@ -980,7 +1082,7 @@ public sealed class MainWindow : Window, IDisposable
     private const string DragLabel = "PosegraphImage";
 
     private static bool IsImage(string path)
-        => Path.GetExtension(path) is { Length: > 1 } ext && ImageExtensions.Contains(ext.ToLowerInvariant());
+        => ImageFiles.IsImage(path);
 
     /// <summary>
     /// 外部文件拖放分两步：每帧用 CreateImGuiSource 把系统拖动转成 ImGui 拖放负载，再由目标区域用 CreateImGuiTarget 接收。
@@ -988,21 +1090,19 @@ public sealed class MainWindow : Window, IDisposable
     /// </summary>
     private void DragSource()
     {
-        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImage), m =>
+        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImageInput), m =>
         {
-            ImGui.TextUnformatted(Loc.F("松开以识别：{0}", Path.GetFileName(m.Files.First(IsImage))));
+            ImGui.TextUnformatted(Loc.F("松开以导入 {0} 个文件或文件夹", m.Files.Count(IsImageInput)));
             return true;
         });
-        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImage))
+        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImageInput))
             _selectTab = 0;
     }
 
     private void DropTarget()
     {
         if (!_dragDrop.CreateImGuiTarget(DragLabel, out var files, out _)) return;
-        var file = files.FirstOrDefault(IsImage);
-        if (file is null) SetError(Loc.T("不支持的文件格式"));
-        else Recognize(file);
+        ImportImagePaths(files);
     }
 
     // ---------------- 3D 火柴人
@@ -1126,6 +1226,11 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawJointPanel()
     {
+        if (_chatPoseActive || _chatTask is not null)
+        {
+            ImGui.TextWrapped(Loc.T("请在“对话”页继续调整。"));
+            return;
+        }
         if (_selected is not { } bone)
         {
             var mhr = _config.ShowMhrInStick;
@@ -1212,6 +1317,18 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawTuningTab()
     {
+        if (_chatPoseActive || _chatTask is not null)
+        {
+            ImGui.TextWrapped(Loc.T("请在“对话”页继续调整。"));
+            using (ImRaii.Disabled(_session is null))
+                if (ImGui.Button(Loc.T("返回图像姿势")))
+                {
+                    ResetChatContext(discardPose: true);
+                    _chatImageDetached = false;
+                    RequestRetarget(false);
+                }
+            return;
+        }
         ImGui.SetNextItemWidth(110);
         var presetLabel = _preset == "illustration" ? Loc.T("插画") : Loc.T("照片");
         if (ImGui.BeginCombo("##preset", presetLabel))
@@ -1284,6 +1401,16 @@ public sealed class MainWindow : Window, IDisposable
             var h = _params.HelperStrength;
             Slider(Loc.T("联动强度##helper"), ref h, 0, 1.5f, "%.2f", 1, Loc.T("肘/腕/肩/膝辅助骨按游戏动画采样的联动规则转动，防止关节处蒙皮变形。1 为游戏拟合值"));
             _params.HelperStrength = h;
+            var experiment = _params.MidlanderFemaleExperiment;
+            if (ImGui.Checkbox(Loc.T("中原女实验适配"), ref experiment))
+            {
+                _params.MidlanderFemaleExperiment = experiment;
+                Interlocked.Increment(ref _previewOnlyRevision);
+                _rtPush = false;
+                _result = null;
+                RequestRetarget(false);
+            }
+            ItemTip(Loc.T("标定范围：原版中原女，身高50、胸围0、脸模f0211。试用胸围0尺寸、肘辅助骨缩放和膝辅助骨曲线；深屈膝仍需更多实机验证。切换仅刷新预览，请手动应用到角色。"));
         }
         if (_result is { } r)
         {
@@ -1314,6 +1441,9 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawWarningsTab()
     {
+        DrawAdvice();
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("本地规则检查"));
         if (_result is not { } r)
         {
             ImGui.TextDisabled(Loc.T("识别后在这里显示合理性检查"));
@@ -1339,7 +1469,7 @@ public sealed class MainWindow : Window, IDisposable
                 _selected = w.Bone;
                 _selectTab = 1;
             }
-            if (w.Group is { } group && w.Suggest is { } suggest && Math.Abs(_params.Amp(group) - suggest) > 0.01f &&
+            if (!_chatPoseActive && _chatTask is null && w.Group is { } group && w.Suggest is { } suggest && Math.Abs(_params.Amp(group) - suggest) > 0.01f &&
                 _params.Amp(group) > suggest)
             {
                 var name = Loc.T(AmplitudeGroups.FirstOrDefault(g => g.Key == group).Label ?? group);
@@ -1350,6 +1480,234 @@ public sealed class MainWindow : Window, IDisposable
                 }
             }
             ImGui.Spacing();
+        }
+    }
+
+    // ---------------- 对话页
+
+    private void CancelChat()
+    {
+        _chatRevision++;
+        _chatCts?.Cancel();
+    }
+
+    private void ResetChatContext(bool discardPose)
+    {
+        if (discardPose) InvalidateAdvice();
+        CancelChat();
+        _chatHistory = [];
+        _chatError = null;
+        _chatFreshStart = false;
+        if (discardPose)
+        {
+            _chatPendingBones.Clear();
+            _lastAppliedPreviewPose = null;
+        }
+        Interlocked.Increment(ref _previewOnlyRevision);
+        _rtDirty = _rtPush = false;
+        if (discardPose && _chatPoseActive)
+        {
+            _result = null;
+            _chatPoseActive = false;
+            _selected = null;
+        }
+    }
+
+    private void SendChat()
+    {
+        if (_chatTask is not null || ImageWorkBusy || _rtBusy || string.IsNullOrWhiteSpace(_chatPrompt)) return;
+        if (!BackendOnline)
+        {
+            _chatError = Loc.T("后端离线：先点右上角电源按钮启动");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_config.ChatApiEndpoint) || string.IsNullOrWhiteSpace(_config.ChatModel))
+        {
+            _chatError = Loc.T("请先在设置中配置 API 并选择模型");
+            _selectTab = 4;
+            return;
+        }
+
+        _chatError = null;
+        _chatSentPrompt = _chatPrompt.Trim();
+        _chatRequestRevision = ++_chatRevision;
+        Interlocked.Increment(ref _previewOnlyRevision);
+        _rtDirty = _rtPush = false;
+        var prompt = _chatSentPrompt;
+        var history = _chatHistory.ToArray();
+        // Brio 尚待清理只影响首次起点；未应用的聊天预览仍是后续轮次的当前姿势。
+        var fresh = _chatFreshStart || (_resetPending && !_chatPoseActive);
+        if (_result?.Pose == _lastAppliedPreviewPose) _chatPendingBones.Clear();
+        if (!fresh && !_chatPoseActive && _result is { } imageResult && imageResult.Pose != _lastAppliedPreviewPose)
+            _chatPendingBones.UnionWith(ChatPoseBoneNames(imageResult.Pose));
+        _chatRequestFullBase = fresh;
+        var pose = fresh ? null : _result?.Pose;
+        var actor = _actor;
+        var race = _raceOverride ?? _detectedRace;
+        var sessionId = fresh || _chatImageDetached ? null : _session?.SessionId;
+        var includeImage = _config.ChatIncludeImage && sessionId is not null;
+        var ground = _chatGround;
+        var provider = new PoseChatProvider(_config.ChatApiEndpoint.Trim(), _chatApiKey, _config.ChatModel.Trim());
+        _chatCts = new CancellationTokenSource();
+        var ct = _chatCts.Token;
+        _chatTask = Task.Run(async () =>
+        {
+            var snapshot = await _applier.GetSnapshotAsync(actor);
+            if (pose is null && !fresh) pose = snapshot?.Pose;
+            ct.ThrowIfCancellationRequested();
+            return await _client.PoseChatAsync(new PoseChatRequest(prompt, history, pose, race, sessionId,
+                                                                  includeImage, ground, provider, snapshot?.Rig, snapshot?.Pose), ct);
+        }, ct);
+        SetStatus(Loc.T("正在生成动作预览…"), Yellow);
+    }
+
+    private void PollChat()
+    {
+        if (_chatTask is not { IsCompleted: true } task) return;
+        try
+        {
+            var response = task.GetAwaiter().GetResult();
+            if (_chatRequestRevision != _chatRevision) return;
+            if (_result?.Pose == _lastAppliedPreviewPose) _chatPendingBones.Clear();
+            _chatPendingBones.UnionWith(ChatPoseBoneNames(_chatRequestFullBase
+                ? response.Result.Pose : response.Result.ApplyPose ?? response.Result.Pose));
+            var (applyPose, facialOnly) = BuildChatApplyPose(response.Result.Pose, response.Result.ApplyPose,
+                                                           _chatPendingBones);
+            _result = response.Result with { ApplyPose = applyPose, FacialOnly = facialOnly };
+            _chatHistory = response.History.TakeLast(20).ToArray();
+            _chatPoseActive = true;
+            _chatFreshStart = false;
+            _selected = null;
+            if (_chatPrompt.Trim() == _chatSentPrompt) _chatPrompt = "";
+            SetStatus(Loc.T("预览已更新"), Green);
+        }
+        catch (OperationCanceledException)
+        {
+            if (_chatRequestRevision == _chatRevision) _chatError = Loc.T("动作生成超时，请重试或检查模型服务");
+        }
+        catch (Exception ex)
+        {
+            if (_chatRequestRevision == _chatRevision)
+            {
+                _chatError = ex.Message;
+                SetError(Loc.T("动作生成失败，原姿势已保留"));
+            }
+        }
+        finally
+        {
+            _chatTask = null;
+            _chatCts?.Dispose();
+            _chatCts = null;
+            if (_chatRequestRevision != _chatRevision && !_chatPoseActive && !_chatFreshStart &&
+                _session is not null && _imageLoadTask is null) RequestRetarget(false);
+        }
+    }
+
+    private static string[] ChatPoseBoneNames(string pose)
+    {
+        using var document = JsonDocument.Parse(pose);
+        return document.RootElement.GetProperty("Bones").EnumerateObject().Select(bone => bone.Name).ToArray();
+    }
+
+    /// <summary>Combine un-applied turns using only their latest full-pose transforms.</summary>
+    internal static (string ApplyPose, bool FacialOnly) BuildChatApplyPose(
+        string fullPose, string? latestPatch, IEnumerable<string> pendingBones)
+    {
+        var full = JsonNode.Parse(fullPose)?.AsObject()
+            ?? throw new InvalidOperationException("Pose response is empty");
+        var transforms = full["Bones"]?.AsObject()
+            ?? throw new InvalidOperationException("Pose response has no bones");
+        var patch = JsonNode.Parse(latestPatch ?? fullPose)?.AsObject()
+            ?? throw new InvalidOperationException("Pose patch is empty");
+        var selected = new JsonObject();
+        foreach (var name in pendingBones.Distinct(StringComparer.Ordinal))
+            if (transforms.TryGetPropertyValue(name, out var transform) && transform is not null)
+                selected[name] = transform.DeepClone();
+        patch["Bones"] = selected;
+        foreach (var slot in new[] { "MainHand", "OffHand", "Prop", "Ornament" }) patch[slot] = new JsonObject();
+        return (patch.ToJsonString(), selected.All(bone => bone.Key.StartsWith("j_f_", StringComparison.Ordinal)));
+    }
+
+    private void DrawChatTab()
+    {
+        ImGui.TextDisabled(Loc.F("模型：{0}", string.IsNullOrWhiteSpace(_config.ChatModel) ? Loc.T("尚未配置") : _config.ChatModel));
+        if (ImGui.SmallButton(Loc.T("配置模型"))) _selectTab = 4;
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.T("新对话")))
+        {
+            ResetChatContext(discardPose: false);
+            SetStatus(Loc.T("已清空对话，保留当前姿势"));
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.T("从默认站姿开始")))
+        {
+            ResetChatContext(discardPose: true);
+            _chatFreshStart = true;
+            _chatImageDetached = true;
+            _result = null;
+            SetStatus(Loc.T("已切换为默认站姿起点"));
+        }
+
+        var includeImage = _config.ChatIncludeImage && !_chatImageDetached;
+        using (ImRaii.Disabled(_session is null || _chatFreshStart || _chatImageDetached || _chatTask is not null))
+            if (ImGui.Checkbox(Loc.T("发送参考图"), ref includeImage))
+            {
+                _config.ChatIncludeImage = includeImage;
+                _pi.SavePluginConfig(_config);
+            }
+        ItemTip(Loc.T("压缩后发送到模型 API，需要视觉模型。"));
+        ImGui.SameLine();
+        ImGui.Checkbox(Loc.T("贴地##chatGround"), ref _chatGround);
+        if (_chatFreshStart) ImGui.TextDisabled(Loc.T("起点：默认站姿"));
+
+        var logHeight = Math.Max(70, ImGui.GetContentRegionAvail().Y - 160 * ImGuiHelpers.GlobalScale);
+        using (var log = ImRaii.Child("##poseChatLog", new Vector2(0, logHeight), true))
+        {
+            if (log)
+            {
+                if (_chatHistory.Length == 0)
+                    ImGui.TextWrapped(Loc.T("例如：左手举过头顶。左右以角色自身为准。"));
+                foreach (var message in _chatHistory)
+                {
+                    ImGui.TextColored(message.Role == "user" ? Green : Orange,
+                                      message.Role == "user" ? Loc.T("你") : Loc.T("动作助手"));
+                    ImGui.TextWrapped(message.Content);
+                    ImGui.Spacing();
+                }
+                if (_chatTask is not null)
+                {
+                    ImGui.TextColored(Green, Loc.T("你"));
+                    ImGui.TextWrapped(_chatSentPrompt);
+                    ImGui.TextColored(Yellow, Loc.T("正在生成动作预览…"));
+                }
+                if (ImGui.GetScrollY() >= ImGui.GetScrollMaxY()) ImGui.SetScrollHereY(1);
+            }
+        }
+        if (_chatError is not null)
+        {
+            using var color = ImRaii.PushColor(ImGuiCol.Text, Red);
+            ImGui.TextWrapped(_chatError);
+        }
+        ImGui.SetNextItemWidth(-1);
+        using (ImRaii.Disabled(_chatTask is not null))
+            ImGui.InputTextMultiline("##poseChatPrompt", ref _chatPrompt, 4000, new Vector2(-1, 60 * ImGuiHelpers.GlobalScale));
+        if (_chatTask is not null)
+        {
+            if (ImGui.Button(Loc.T("取消生成")))
+            {
+                CancelChat();
+                SetStatus(Loc.T("已取消动作生成，原姿势已保留"));
+            }
+        }
+        else
+        {
+            using (ImRaii.Disabled(!BackendOnline || ImageWorkBusy || _rtBusy || string.IsNullOrWhiteSpace(_chatPrompt)))
+                if (ImGui.Button(Loc.T("生成预览"))) SendChat();
+        }
+        if (_chatPoseActive)
+        {
+            ImGui.SameLine();
+            if (ImGui.Button(Loc.T("查看 3D"))) _selectTab = 1;
         }
     }
 
@@ -1436,7 +1794,10 @@ public sealed class MainWindow : Window, IDisposable
         if (modelChanged && BackendOnline)
             _ = Run(async () => { await _client.ConfigureAsync(_config); SetStatus(Loc.T("已更新识别设备设置（下次加载生效）")); });
         changed |= modelChanged;
+        changed |= DrawRecognitionConcurrencySettings();
         changed |= Check(Loc.T("退出时关闭插件启动的后端"), _config.StopBackendOnExit, v => _config.StopBackendOnExit = v);
+
+        changed |= DrawChatSettings();
 
         ImGui.Separator();
         ImGui.TextDisabled(Loc.T("操作"));
@@ -1472,6 +1833,125 @@ public sealed class MainWindow : Window, IDisposable
                 ImGui.TextUnformatted(line);
             if (ImGui.GetScrollY() >= ImGui.GetScrollMaxY()) ImGui.SetScrollHereY(1);
         }
+    }
+
+    private void InvalidateModelCatalog()
+    {
+        _modelsRevision++;
+        _modelsCts?.Cancel();
+        _modelsError = null;
+        _chatModels = [];
+        _config.ChatModels = [];
+        _config.ChatModelsEndpoint = "";
+    }
+
+    private void FetchModelCatalog()
+    {
+        if (_modelsTask is not null || _chatTask is not null || string.IsNullOrWhiteSpace(_config.ChatApiEndpoint)) return;
+        _modelsError = null;
+        _modelsRequestEndpoint = _config.ChatApiEndpoint.Trim();
+        _modelsRequestRevision = ++_modelsRevision;
+        var endpoint = _modelsRequestEndpoint;
+        var key = _chatApiKey;
+        _modelsCts = new CancellationTokenSource();
+        var ct = _modelsCts.Token;
+        _modelsTask = Task.Run(() => _modelCatalog.FetchAsync(endpoint, key, ct), ct);
+    }
+
+    private void PollModelCatalog()
+    {
+        if (_modelsTask is not { IsCompleted: true } task) return;
+        try
+        {
+            var models = task.GetAwaiter().GetResult();
+            if (_modelsRequestRevision != _modelsRevision || _modelsRequestEndpoint != _config.ChatApiEndpoint.Trim()) return;
+            _chatModels = models;
+            _config.ChatModels = models;
+            _config.ChatModelsEndpoint = _modelsRequestEndpoint;
+            _pi.SavePluginConfig(_config);
+            if (models.Length == 0) _modelsError = Loc.T("服务未返回模型");
+        }
+        catch (OperationCanceledException)
+        {
+            if (_modelsRequestRevision == _modelsRevision) _modelsError = Loc.T("拉取模型超时，请重试");
+        }
+        catch (Exception ex)
+        {
+            if (_modelsRequestRevision == _modelsRevision) _modelsError = ex.Message;
+        }
+        finally
+        {
+            _modelsTask = null;
+            _modelsCts?.Dispose();
+            _modelsCts = null;
+        }
+    }
+
+    private bool DrawChatSettings()
+    {
+        ImGui.Separator();
+        ImGui.TextDisabled(Loc.T("提示词动作"));
+        var changed = false;
+        using (ImRaii.Disabled(_chatTask is not null))
+        {
+            using (ImRaii.Disabled(_modelsTask is not null))
+            {
+                var endpoint = _config.ChatApiEndpoint;
+                ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 100));
+                if (ImGui.InputText(Loc.T("API 端点##chatEndpoint"), ref endpoint, 2048))
+                {
+                    _config.ChatApiEndpoint = endpoint.Trim();
+                    InvalidateModelCatalog();
+                    changed = true;
+                }
+                ItemTip(Loc.T("兼容 OpenAI 的 API 基址或完整 /chat/completions 地址。"));
+                ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 100));
+                if (ImGui.InputText(Loc.T("API 密钥##chatKey"), ref _chatApiKey, 4096, ImGuiInputTextFlags.Password))
+                {
+                    InvalidateModelCatalog();
+                    changed = true;
+                    try
+                    {
+                        _config.ChatApiKeyProtected = ApiKeyProtection.Protect(_chatApiKey);
+                        _chatError = null;
+                    }
+                    catch { _chatError = Loc.T("无法加密 API 密钥，本次密钥未保存"); }
+                }
+                ItemTip(Loc.T("在本机加密保存；无需认证可留空。"));
+            }
+
+            using (ImRaii.Disabled(_modelsTask is not null || string.IsNullOrWhiteSpace(_config.ChatApiEndpoint)))
+                if (ImGui.Button(Loc.T(_modelsTask is null ? "拉取模型" : "拉取中…"))) FetchModelCatalog();
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 100));
+            var modelLabel = !string.IsNullOrWhiteSpace(_config.ChatModel) ? _config.ChatModel
+                : Loc.T(_chatModels.Length == 0 ? "先拉取模型" : "选择模型");
+            using (ImRaii.Disabled(_modelsTask is not null || _chatModels.Length == 0))
+            {
+                if (ImGui.BeginCombo(Loc.T("模型名##chatModel"), modelLabel))
+                {
+                    foreach (var model in _chatModels)
+                        if (ImGui.Selectable(model, _config.ChatModel == model))
+                        {
+                            _config.ChatModel = model;
+                            _chatError = null;
+                            changed = true;
+                        }
+                    ImGui.EndCombo();
+                }
+            }
+        }
+        if (_modelsError is not null)
+        {
+            using var color = ImRaii.PushColor(ImGuiCol.Text, Red);
+            ImGui.TextWrapped(_modelsError);
+        }
+        if (_chatError is not null)
+        {
+            using var color = ImRaii.PushColor(ImGuiCol.Text, Red);
+            ImGui.TextWrapped(_chatError);
+        }
+        return changed;
     }
 
     /// <summary>设置页的后端更新区域。返回配置是否有改动。</summary>

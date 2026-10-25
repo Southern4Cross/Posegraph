@@ -38,6 +38,7 @@ class RetargetParams(BaseModel):
     upright_max_deg: float = UPRIGHT_MAX_DEG
     ground: bool = True
     helper_strength: float = 1.0
+    midlander_female_experiment: bool = False
 
 
 # 预设：插画的头颈比例夸张，识别容易把头颈角度估大（游戏实测 0.7 合适）
@@ -60,7 +61,8 @@ def run(human: dict, image_size: tuple[int, int], params: RetargetParams,
                     upright=params.upright, upright_max_deg=params.upright_max_deg, ground=params.ground,
                     amplitude=amp, offsets={k: tuple(v) for k, v in params.offsets.items()},
                     hand_strength=params.hand_strength, hand_near=params.hand_near, hand_far=params.hand_far,
-                    helper_strength=params.helper_strength, reference_lengths=reference_lengths, ivcs=ivcs)
+                    helper_strength=params.helper_strength, reference_lengths=reference_lengths, ivcs=ivcs,
+                    midlander_female_experiment=params.midlander_female_experiment)
 
 
 # ---------------------------------------------------------------- 合理性检查

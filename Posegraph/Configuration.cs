@@ -40,11 +40,25 @@ public class Configuration : IPluginConfiguration
     /// <summary>GPU 模式下把 MHR 留在 CPU，显存约省 750MB，每张约慢 0.5 秒。</summary>
     public bool MhrOnCpu { get; set; } = true;
 
+    /// <summary>多图预识别最多同时处理的图片数（1～8），默认串行；从下一批图片生效。</summary>
+    public int BatchRecognitionParallelism { get; set; } = 1;
+
     /// <summary>插件卸载 / 游戏退出时关闭由插件启动的后端。</summary>
     public bool StopBackendOnExit { get; set; } = true;
 
     /// <summary>后端更新的下载加速前缀（加在 GitHub 地址前面，如 https://gh-proxy.org/），空为直连。</summary>
     public string UpdateProxy { get; set; } = "";
+
+    // ---- 提示词动作（OpenAI 兼容 Chat Completions 服务）
+    public string ChatApiEndpoint { get; set; } = "";
+    public string ChatModel { get; set; } = "";
+    /// <summary>上次拉取的模型列表，只用于对应的 API 端点。</summary>
+    public string[] ChatModels { get; set; } = [];
+    public string ChatModelsEndpoint { get; set; } = "";
+    /// <summary>Windows 当前用户 DPAPI 加密的 API 密钥，不保存明文。</summary>
+    public string ChatApiKeyProtected { get; set; } = "";
+    /// <summary>明确开启后才会把导入图像发给配置的模型服务。</summary>
+    public bool ChatIncludeImage { get; set; }
 
     // ---- 操作习惯
     /// <summary>松开滑杆时自动应用到角色（拖动中只更新预览）。</summary>

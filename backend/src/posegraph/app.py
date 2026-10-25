@@ -8,8 +8,11 @@
   POST /model/config                   设备（auto/cuda/cpu）、释放策略（识别后空闲多少秒释放，0 立即、-1 常驻）、MHR 是否放 CPU
   POST /sessions?name=xx               请求体为图片原始字节（jpg/png/webp/bmp/gif 首帧/tiff/avif），识别一次并缓存
   GET  /sessions/{id}/image            预览图（PNG，长边不超过 1280）
+  DELETE /sessions/{id}                删除图片及预识别缓存
   POST /sessions/{id}/retarget         按参数重定向（只算重定向，几十毫秒），返回 Brio 姿势、叠加层、火柴人、合理性提示
   POST /sessions/{id}/camera           按照片镜头设置 GPose 相机（经 Posegraph HTTP 闭环求解）
+  POST /chat/pose                      多轮对话生成或编辑姿势，只更新预览
+  POST /chat/advice                    主动分析当前姿势，只返回建议，不修改姿势
   GET  /presets                        参数预设
   GET  /races                          支持的种族骨架（retarget/races.py）
   POST /shutdown                       退出服务
@@ -23,14 +26,14 @@ import io
 import threading
 import time
 import uuid
-from collections import OrderedDict
-from dataclasses import dataclass
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import tuning
 from .config import SERVICE_ROOT, settings
@@ -41,13 +44,21 @@ from .i18n import set_language, tr
 from .retarget import races
 from .retarget.brio_pose import BrioPose
 from .retarget.ffxiv import load_mhr_rest, to_brio_pose_json
+from .pose_chat import MAX_HISTORY, PoseChatRequest, request_plan
+from .pose_advice import PoseAdviceRequest, build_advice_context, request_advice
+from .session_cache import Session, SessionCache
+from .inference_pool import InferenceFailure, InferencePool, ModelLifecycle
+from .i18n import _lang
 
 app = FastAPI(title="posegraph", version=__version__)
 _estimator = create_estimator()
-# 加载、推理、释放互斥（释放不能打断正在进行的识别）
+# 默认单模型串行；并行槽使用独立进程，加载/配置/释放等待正在运行的识别。
 _model_lock = threading.RLock()
+_model_lifecycle = ModelLifecycle()
 _model_state = {"loading": False, "error": None}
 _release_after = settings.release_after
+_recognition_parallelism = settings.recognition_parallelism
+_parallel_pool: InferencePool | None = None
 _last_used = time.monotonic()
 
 PREVIEW_MAX_SIDE = 1280
@@ -55,17 +66,19 @@ MAX_SESSIONS = 8
 OUTPUTS = SERVICE_ROOT / "outputs" / "ui"
 
 
-@dataclass
-class Session:
-    id: str
-    name: str
-    image_size: tuple[int, int]
-    preview_png: bytes
-    humans: list[dict]          # 键同 image_to_pose 的 npz
-    inference_ms: float
+# 大批图片只保留最近使用的 8 份在内存，其余暂存磁盘；选择时直接恢复，不再推理。
+_sessions = SessionCache(MAX_SESSIONS)
 
 
-_sessions: OrderedDict[str, Session] = OrderedDict()
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, error: RequestValidationError):
+    if request.url.path in ("/chat/pose", "/chat/advice"):
+        # FastAPI's default error includes rejected input, which can contain
+        # provider credentials. Return field locations/messages only.
+        return JSONResponse(status_code=422, content={"detail": [
+            {"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in error.errors()
+        ]})
+    return await request_validation_exception_handler(request, error)
 
 
 @app.middleware("http")
@@ -75,7 +88,7 @@ async def _language(request: Request, call_next):
     return await call_next(request)
 
 
-def _load_model() -> None:
+def _load_serial_model() -> None:
     with _model_lock:
         if _estimator.loaded:
             return
@@ -89,8 +102,45 @@ def _load_model() -> None:
             _model_state["loading"] = False
 
 
-def _unload_model() -> None:
+def _worker_config() -> dict:
+    return {key: getattr(_estimator, key) for key in
+            ("device", "precision", "share_mhr", "mhr_on_cpu", "min_free_vram_mb")
+            if hasattr(_estimator, key)}
+
+
+def _get_parallel_pool() -> InferencePool:
+    global _parallel_pool
     with _model_lock:
+        if _parallel_pool is None:
+            _parallel_pool = InferencePool(_recognition_parallelism, _worker_config())
+        return _parallel_pool
+
+
+def _close_parallel_pool() -> None:
+    global _parallel_pool
+    if _parallel_pool is not None:
+        _parallel_pool.close()
+        _parallel_pool = None
+
+
+def _load_model() -> None:
+    with _model_lifecycle.exclusive():
+        if _recognition_parallelism == 1:
+            _load_serial_model()
+        else:
+            _model_state.update(loading=True, error=None)
+            try:
+                _get_parallel_pool().preload(_lang.get())
+            except Exception as error:
+                _model_state["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                _model_state["loading"] = False
+
+
+def _unload_model() -> None:
+    with _model_lifecycle.exclusive(), _model_lock:
+        _close_parallel_pool()
         _estimator.unload()
 
 
@@ -98,21 +148,39 @@ def _release_loop() -> None:
     """按策略释放模型：识别后空闲超过 release_after 秒就卸载（0 在识别结束时立即卸载，见 _estimate）。"""
     while True:
         time.sleep(2)
-        idle = lambda: (_release_after > 0 and _estimator.loaded and not _model_state["loading"]
-                        and time.monotonic() - _last_used > _release_after)
-        if idle():
-            with _model_lock:   # 拿到锁时可能刚识别完，再判断一次
-                if idle():
-                    _estimator.unload()
+        _release_idle_models()
+
+
+def _release_idle_models() -> None:
+    idle = lambda: (_release_after > 0 and _model_info()["loaded"] and not _model_info()["loading"]
+                    and time.monotonic() - _last_used > _release_after)
+    if idle():
+        with _model_lifecycle.exclusive(), _model_lock:
+            if idle():
+                _close_parallel_pool()
+                _estimator.unload()
 
 
 def _model_info() -> dict:
-    return {"loaded": _estimator.loaded, "loading": _model_state["loading"], "error": _model_state["error"],
+    info = {"loaded": _estimator.loaded, "loading": _model_state["loading"], "error": _model_state["error"],
             "device": getattr(_estimator, "active_device", None), "precision": getattr(_estimator, "active_precision", None),
             "deviceReason": _reason(getattr(_estimator, "device_reason", ("",))),
             "config": {"device": getattr(_estimator, "device", None), "releaseAfter": _release_after,
                        "mhrOnCpu": getattr(_estimator, "mhr_on_cpu", None),
-                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None)}}
+                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None),
+                       "recognitionParallelism": _recognition_parallelism}}
+    pool = _parallel_pool
+    if _recognition_parallelism > 1:
+        states = pool.states if pool is not None else []
+        active = next((state for state in states if state["loaded"]), None)
+        info.update(loaded=any(state["loaded"] for state in states),
+                    loading=_model_state["loading"] or any(state["loading"] for state in states),
+                    error=next((state["error"] for state in states if state["error"]), _model_state["error"]),
+                    workers=states, activeInferences=_model_lifecycle.active)
+        if active:
+            info.update(device=active["device"], precision=active["precision"],
+                        deviceReason=_reason(active["device_reason"]))
+    return info
 
 
 def _reason(r) -> str:
@@ -131,7 +199,8 @@ def health() -> dict:
 
 @app.post("/model/load")
 def model_load() -> dict:
-    if not _estimator.loaded and not _model_state["loading"]:
+    info = _model_info()
+    if not info["loaded"] and not info["loading"]:
         threading.Thread(target=lambda: _safe(_load_model), daemon=True).start()
     return {"model": _model_info()}
 
@@ -154,22 +223,27 @@ class ModelConfig(BaseModel):
     release_after: float | None = None  # 秒；0 立即释放，-1 常驻
     mhr_on_cpu: bool | None = None
     min_free_vram_mb: int | None = None
+    recognition_parallelism: int | None = Field(default=None, ge=1, le=8, strict=True)
 
 
 @app.post("/model/config")
 def model_config(cfg: ModelConfig) -> dict:
     """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。"""
-    global _release_after
+    global _release_after, _recognition_parallelism
     if cfg.device is not None and cfg.device not in ("auto", "cuda", "cpu"):
         raise HTTPException(400, tr("device 只能是 auto / cuda / cpu"))
-    with _model_lock:
+    with _model_lifecycle.exclusive(), _model_lock:
         reload = False
         for key in ("device", "mhr_on_cpu", "min_free_vram_mb"):
             value = getattr(cfg, key)
             if value is not None and getattr(_estimator, key) != value:
                 setattr(_estimator, key, value)
                 reload = True
-        if reload and _estimator.loaded:
+        if cfg.recognition_parallelism is not None and cfg.recognition_parallelism != _recognition_parallelism:
+            _recognition_parallelism = cfg.recognition_parallelism
+            reload = True
+        if reload:
+            _close_parallel_pool()
             _estimator.unload()
         if cfg.release_after is not None:
             _release_after = cfg.release_after
@@ -204,11 +278,10 @@ def _preview_png(rgb: np.ndarray) -> bytes:
 
 
 def _session(sid: str) -> Session:
-    s = _sessions.get(sid)
-    if s is None:
+    try:
+        return _sessions[sid]
+    except KeyError:
         raise HTTPException(404, tr("会话不存在（后端重启过？请重新识别）"))
-    _sessions.move_to_end(sid)
-    return s
 
 
 @app.post("/sessions")
@@ -227,9 +300,7 @@ async def create_session(request: Request, name: str = "image") -> dict:
                        "vertices": h.extra["vertices"], "rest_vertices": h.extra["rest_vertices"]})
     sid = uuid.uuid4().hex[:12]
     session = Session(sid, name, result.image_size, _preview_png(rgb), humans, result.timings_ms["inference"])
-    _sessions[sid] = session
-    while len(_sessions) > MAX_SESSIONS:
-        _sessions.popitem(last=False)
+    await run_in_threadpool(_sessions.__setitem__, sid, session)
 
     if settings.save_sessions:   # 存一份 npz，命令行脚本（push_pose / preview_overlay / Blender 对比）可直接复用
         OUTPUTS.mkdir(parents=True, exist_ok=True)
@@ -243,17 +314,26 @@ async def create_session(request: Request, name: str = "image") -> dict:
 def _estimate(data: bytes):
     global _last_used
     rgb = _decode(data)
-    with _model_lock:
+    with _model_lifecycle.inference():
         try:
-            _load_model()
-        except Exception as ex:
-            raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
-        try:
-            result = _estimator.estimate(rgb)
+            if _recognition_parallelism > 1:
+                try:
+                    result = _get_parallel_pool().estimate(rgb, _release_after, _lang.get())
+                except InferenceFailure as error:
+                    raise HTTPException(error.status, str(error)) from error
+            else:
+                with _model_lock:
+                    try:
+                        _load_serial_model()
+                    except Exception as ex:
+                        raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
+                    try:
+                        result = _estimator.estimate(rgb)
+                    finally:
+                        if _release_after == 0:
+                            _estimator.unload()
         finally:
             _last_used = time.monotonic()
-            if _release_after == 0:
-                _estimator.unload()
     if not result.humans:
         raise HTTPException(422, tr("未检测到人物"))
     return rgb, result
@@ -262,6 +342,12 @@ def _estimate(data: bytes):
 @app.get("/sessions/{sid}/image")
 def session_image(sid: str) -> Response:
     return Response(_session(sid).preview_png, media_type="image/png")
+
+
+@app.delete("/sessions/{sid}")
+def delete_session(sid: str) -> dict:
+    _sessions.discard(sid)
+    return {"deleted": True}
 
 
 class RetargetRequest(BaseModel):
@@ -355,6 +441,69 @@ def session_retarget(sid: str, req: RetargetRequest) -> dict:
     return out
 
 
+@app.post("/chat/pose")
+async def pose_chat(req: PoseChatRequest) -> dict:
+    """Stateless, multi-turn pose editing; no image estimator is loaded.
+
+    The plugin retains history/current pose. Keys and images are never written
+    to disk by this endpoint. Only an explicit include_image sends the preview.
+    """
+    from .prompt_pose import PoseEditError, SYSTEM_PROMPT, apply_edits, build_context
+
+    if req.race is not None and req.race not in races.RACES:
+        raise HTTPException(400, tr("未知的种族骨架：{code}", code=req.race))
+    rig = req.rig.model_dump() if req.rig is not None else None
+    try:
+        reference = BrioPose.loads(req.pose or req.actor_pose) if req.pose or req.actor_pose else None
+        if reference is not None and not isinstance(reference.raw, dict):
+            raise ValueError()
+        race = _resolve_race(req.race, reference)
+        context = await run_in_threadpool(build_context, req.pose, race["code"], rig, req.actor_pose)
+        # Reject nonfinite composed transforms before contacting the provider.
+        import json
+        json.dumps(context, allow_nan=False)
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError):
+        raise HTTPException(400, tr("当前姿势无效，请重新导入图像或从默认站姿开始")) from None
+    preview = None
+    if req.include_image:
+        if not req.session_id:
+            raise HTTPException(400, tr("发送参考图需要先导入并识别一张图片"))
+        preview = _session(req.session_id).preview_png
+    reply, edits = await request_plan(req, context, SYSTEM_PROMPT, preview)
+    try:
+        result = await run_in_threadpool(apply_edits, req.pose, race["code"], edits, req.ground, rig, req.actor_pose)
+    except PoseEditError:
+        raise HTTPException(502, tr("模型提出了无效的骨骼调整，姿势未更改；请重试或缩小调整范围")) from None
+    result["race"] = race
+    history = [m.model_dump() for m in req.history]
+    history.extend([{"role": "user", "content": req.prompt}, {"role": "assistant", "content": reply}])
+    return {"reply": reply, "result": result, "history": history[-MAX_HISTORY:]}
+
+
+@app.post("/chat/advice")
+async def pose_advice(req: PoseAdviceRequest) -> dict:
+    """Explicit, stateless analysis. No retarget, edit execution or model loading."""
+    if req.race is not None and req.race not in races.RACES:
+        raise HTTPException(400, tr("未知的种族骨架：{code}", code=req.race))
+    try:
+        reference = BrioPose.loads(req.pose)
+        if not isinstance(reference.raw, dict):
+            raise ValueError()
+        race = _resolve_race(req.race, reference)
+        context = await run_in_threadpool(build_advice_context, req, race)
+        # Reject nonfinite nested slider/rig data before sending anything.
+        import json
+        json.dumps(context, allow_nan=False)
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError):
+        raise HTTPException(400, tr("当前姿势无效，请重新导入图像或读取角色姿势")) from None
+    preview = None
+    if req.include_image:
+        if not req.session_id:
+            raise HTTPException(400, tr("发送参考图需要先导入并识别一张图片"))
+        preview = _session(req.session_id).preview_png
+    return await request_advice(req, context, preview)
+
+
 class CameraRequest(BaseModel):
     person: int = 0
     params: tuning.RetargetParams = tuning.RetargetParams()
@@ -401,7 +550,13 @@ def shutdown() -> dict:
     """插件"停止后端"用（后端可能不是插件启动的，拿不到进程句柄）。"""
     import os
 
-    threading.Timer(0.3, lambda: os._exit(0)).start()
+    def stop():
+        try:
+            _unload_model()  # waits for active recognition, then reaps child workers
+            _sessions.close()
+        finally:
+            os._exit(0)
+    threading.Timer(0.3, stop).start()
     return {"ok": True}
 
 

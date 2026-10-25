@@ -134,6 +134,92 @@ def _twist_swing_features(dev: R) -> np.ndarray:
     return np.array([twist, sv[1], sv[2]])
 
 
+@cache
+def _midlander_female_profile() -> dict:
+    """Opt-in, single-baseline calibration; this does not change supported races."""
+    return json.loads((DATA_DIR / "c0201_experiment.json").read_text(encoding="utf-8"))
+
+
+def _midlander_female_elbow_scales(sk, G: list[R], G_bind: list[R], reference: BrioPose | None,
+                                  strength: float, profile: dict) -> tuple[dict[str, np.ndarray], dict]:
+    """Apply the measured signed bend on this original-body unit scale baseline.
+
+    Scope: original c0201 with unit parent scales and unit helper X. Preserve X,
+    but do not infer constant Y/Z from the current pose: it may already be an
+    experimental output. This makes strength changes and recapture idempotent.
+    Custom helper Y/Z modifications are outside this opt-in calibration's scope.
+    Without a reference, preview/export uses the canonical unit-scale skeleton.
+    Only target scale factors are saturated to the measured domain, not rotations.
+    """
+    config = profile["elbow_scale"]
+    result, info = {}, {}
+    if not np.isfinite(strength):
+        return result, {"skipped": "non_finite_strength"}
+    amount = float(np.clip(strength, 0, 1))
+
+    def factor(degrees: float) -> np.ndarray:
+        return np.array([1.0, 1.0 - degrees / config["y_bend_degrees_divisor"],
+                         1.0 - degrees / config["z_bend_degrees_divisor"]])
+
+    for side in "lr":
+        helper, driver = f"n_hhiji_{side}", f"j_ude_b_{side}"
+        d = sk.index(driver)
+        p = sk.parents[d]
+        rest_local = G_bind[p].inv() * G_bind[d]
+        bend = float(np.degrees(_twist_swing_features(rest_local.inv() * (G[p].inv() * G[d]))[2]))
+        lo, hi = config["bend_domain_degrees"][side]
+        target_bend = float(np.clip(bend, lo, hi))
+        base_scale = np.ones(3)
+        if reference is not None:
+            ref_helper = reference.get(helper)
+            if ref_helper is None:
+                info[side] = {"skipped": "missing_reference_bone"}
+                continue
+            # The calibration does not establish composition under inherited
+            # nonuniform scales (e.g. a custom skeleton/Customize+ profile).
+            ancestor = d
+            unit_parents = True
+            while ancestor >= 0:
+                transform = reference.get(sk.names[ancestor])
+                if transform is None or not np.allclose(transform.scale, 1, atol=1e-4, rtol=0):
+                    unit_parents = False
+                    break
+                ancestor = sk.parents[ancestor]
+            if not unit_parents:
+                info[side] = {"skipped": "nonunit_or_missing_parent_scale"}
+                continue
+            if not np.isfinite(ref_helper.scale).all() or not np.isclose(ref_helper.scale[0], 1, atol=1e-4, rtol=0):
+                info[side] = {"skipped": "nonunit_or_invalid_helper_x_scale"}
+                continue
+            base_scale[0] = ref_helper.scale[0]
+        result[helper] = base_scale * (np.ones(3) + amount * (factor(target_bend) - 1))
+        info[side] = {"bend_deg": round(bend, 3), "scale_bend_deg": round(target_bend, 3),
+                      "clamped": not np.isclose(bend, target_bend), "constant_scale_policy": "original_body_unit_yz",
+                      "reference_mode": "canonical" if reference is None else "verified_unit_parent_chain",
+                      "strength": amount, "scale": result[helper].tolist()}
+    return result, info
+
+
+def _midlander_female_knee_angle(bend: float, side: str, strength: float,
+                                profile: dict) -> tuple[float, dict]:
+    """Frozen kneeling fit, independently checked on the happy action to 80.6°.
+
+    Saturate the helper's input to captured angles; never change the main shin
+    rotation. The deeper range has single-action/cross-side validation only.
+    """
+    config = profile["knee_rotation"]
+    degrees = float(np.degrees(bend))
+    lo, hi = config["bend_domain_degrees"][side]
+    bounded_degrees = float(np.clip(degrees, lo, hi))
+    x = float(np.radians(bounded_degrees))
+    a, b = config["coefficients_rad"][side]
+    angle = float(strength * (a * x + b * x ** 3))
+    return angle, {"bend_deg": degrees, "curve_bend_deg": bounded_degrees,
+                   "clamped": not np.isclose(degrees, bounded_degrees),
+                   "helper_deg": float(np.degrees(angle)),
+                   "deep_single_action_range": bounded_degrees > config["independent_action_max_degrees"]}
+
+
 @dataclass
 class Skeleton:
     names: list[str]
@@ -476,7 +562,8 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
              hand_strength: float = 1.0, hand_near: float = HAND_CONTACT_NEAR, hand_far: float = HAND_CONTACT_FAR,
              upright_max_deg: float = UPRIGHT_MAX_DEG, helper_strength: float = 1.0,
              rest_vertices: np.ndarray | None = None, reference_lengths: bool = True,
-             ivcs: bool = True) -> RetargetResult:
+             ivcs: bool = True,
+             midlander_female_experiment: bool = False) -> RetargetResult:
     """joint_global_rots: (127,3,3) SAM 3D Body 输出 pred_global_rots；
     joint_coords_cam: (127,3) pred_joint_coords（相机系，仅用于自检）；
     rest_coords / rest_rots: 该人物体型下的零姿态（缺省用平均体型 mhr_rest.json，骨段方向会有几度系统误差）；
@@ -500,8 +587,10 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
     ground: 自动贴地。n_hara 的高度固定在站立高度，倒立/跪坐/躺下时角色会悬空，
     开启后把最低的关节平移到绑定姿势中最低关节的高度（跳跃照片也会被按到地面上）；
     ivcs: 游戏角色加载了 IVCS 骨骼。False 时手指第三节（iv_*_c）的弯曲取一半并入第二节，输出不含 iv_ 骨骼
-    （原版骨架没有第三节，第二节的蒙皮一直覆盖到指尖）。脚趾 iv_asi_* 本来就不驱动，没有可折算的。"""
+    （原版骨架没有第三节，第二节的蒙皮一直覆盖到指尖）。脚趾 iv_asi_* 本来就不驱动，没有可折算的；
+    midlander_female_experiment: 原版中原女身高50/胸围0的默认关闭标定实验。"""
     sk = _with_reference_lengths(load_ffxiv_skeleton(race), reference if reference_lengths else None)
+    female_profile = _midlander_female_profile() if midlander_female_experiment and race == "c0201" else None
     mhr_names, mean_pos, mean_rot = load_mhr_rest()
     mhr_rest_pos = mean_pos if rest_coords is None else rest_coords
     mhr_rest_rot = mean_rot if rest_rots is None else R.from_matrix(rest_rots)
@@ -538,13 +627,16 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
 
     # 末端补偿（需要 MHR 关节坐标）：在辅助骨之前做，辅助骨会随新的手臂角度联动
     compensation = {}
+    if midlander_female_experiment:
+        compensation["midlander_female_experiment"] = {"active": female_profile is not None,
+                                                       "profile": "c0201_height50_bust0_f0211" if female_profile else None}
     if compensate_head and mhr_model is not None:
         compensation["head_shift_cm"] = _compensate_head(sk, G, P, G_new, mhr_names, mhr_model, mhr_rest_pos)
         G, P = forward_kinematics(sk, G_new)
     if compensate_hands and hand_strength > 0 and mhr_model is not None:
         extents = None
         from .body import ffxiv_extents, mhr_extents
-        ff_ext = ffxiv_extents(race)
+        ff_ext = female_profile["body_extents"] if female_profile else ffxiv_extents(race)
         if ff_ext is not None and rest_vertices is not None:
             extents = (ff_ext, mhr_extents(rest_vertices, mhr_rest_pos, mhr_names))
         G_bind0, _ = forward_kinematics(sk)
@@ -578,12 +670,24 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
         d, h = sk.index(rule.driver), sk.index(rule.helper)
         b = sk.index(rule.base) if rule.base else sk.parents[d]
         dev = (G_bind[b].inv() * G_bind[d]).inv() * (G[b].inv() * G[d])
-        angle = helper_strength * (float(np.dot(rule.coef, _twist_swing_features(dev))) + np.radians(rule.intercept_deg))
+        features = _twist_swing_features(dev)
+        if female_profile is not None and rule.helper in ("j_asi_b_l", "j_asi_b_r"):
+            side = rule.helper[-1]
+            angle, knee_info = _midlander_female_knee_angle(float(features[2]), side, helper_strength, female_profile)
+            compensation["midlander_female_experiment"].setdefault("knee_rotations", {})[side] = knee_info
+        else:
+            angle = helper_strength * (float(np.dot(rule.coef, features)) + np.radians(rule.intercept_deg))
         rotvec = np.zeros(3)
         rotvec[rule.axis] = angle
         G_new[h] = G[sk.parents[h]] * sk.local_r[h] * R.from_rotvec(rotvec)
     if HELPER_RULES:
         G, P = forward_kinematics(sk, G_new)
+
+    calibrated_scales = {}
+    if female_profile is not None:
+        calibrated_scales, scale_info = _midlander_female_elbow_scales(sk, G, G_bind, reference,
+                                                                     helper_strength, female_profile)
+        compensation["midlander_female_experiment"]["elbow_scales"] = scale_info
 
     if ground:
         body = [i for i, n in enumerate(sk.names) if n.startswith(("j_", "iv_asi_")) and not n.startswith(("j_sk_", "j_kami", "j_f_", "j_ex_"))]
@@ -600,6 +704,8 @@ def retarget(joint_global_rots: np.ndarray, joint_coords_cam: np.ndarray | None 
             keep.add(i)
             i = sk.parents[i]
     def scale_of(name: str) -> np.ndarray:
+        if name in calibrated_scales:
+            return calibrated_scales[name]
         t = reference.get(name) if reference is not None else None
         return t.scale if t is not None else np.ones(3)
 

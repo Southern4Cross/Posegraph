@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "race": "c0201",
+  "experimental": true,
+  "scope": {
+    "body": "game original",
+    "height_slider": 50,
+    "bust_slider": 0,
+    "face_model": "c0201f0211",
+    "game_validation_complete": false
+  },
+  "body_extents": {
+    "head": {
+      "half_x": 0.0468,
+      "half_z": 0.0833,
+      "cz": -0.0195,
+      "half_y": 0.0826,
+      "cy": 0.0443
+    },
+    "chest": {
+      "half_x": 0.1179,
+      "half_z": 0.0877,
+      "cz": 0.027
+    },
+    "hip": {
+      "half_x": 0.1594,
+      "half_z": 0.0864,
+      "cz": -0.025
+    }
+  },
+  "elbow_scale": {
+    "y_bend_degrees_divisor": 180.0,
+    "z_bend_degrees_divisor": 400.0,
+    "bend_domain_degrees": {
+      "l": [
+        -136.08806492149733,
+        0.0
+      ],
+      "r": [
+        -97.31130109455249,
+        3.8994464254543857
+      ]
+    },
+    "domain_note": "Captured side-specific domains, including the neutral bind anchor. Clamp target scale only; never clamp main-bone rotation.",
+    "constant_scale_policy": "Original body unit Y/Z baseline, preserve helper X. Do not rebase from current reference Y/Z: it can already contain experimental scaling. Custom helper Y/Z modifications are not supported."
+  },
+  "provenance": {
+    "geometry": "Meddle reference exports; skinning checked independently against Blender 4.5.3",
+    "body_policy": "Visible top/dwn proxy surface includes smallclothes; face uses skin meshes only. The bust-0 candidate excludes animation-driven shoulder/elbow scales.",
+    "animation_actions": [
+      "wave",
+      "cheer",
+      "praise_overhead",
+      "kneeling_apology",
+      "happy"
+    ],
+    "animation_frames": 2670,
+    "rotation_rules": "Shoulder, elbow and wrist rotation rules remain unchanged. Experimental knee helper curve only for j_asi_b_l/r; scale Y/Z only for n_hhiji_l/r."
+  },
+  "knee_rotation": {
+    "coefficients_rad": {
+      "l": [
+        0.33118660723358073,
+        0.016835663381907843
+      ],
+      "r": [
+        0.33139141710850145,
+        0.016781571506543868
+      ]
+    },
+    "bend_domain_degrees": {
+      "l": [
+        -4.616946526227707,
+        154.8034695192356
+      ],
+      "r": [
+        -4.01231383547391,
+        153.14029535663167
+      ]
+    },
+    "fit_action": "kneeling_apology",
+    "independent_validation_action": "happy",
+    "independent_action_max_degrees": 80.63181720359283,
+    "note": "Coefficients were frozen before independent validation. Deeper angles have single-action/cross-side/phase validation only. Limits apply to the helper curve, not main leg rotation."
+  }
+}

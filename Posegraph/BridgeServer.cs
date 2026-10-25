@@ -11,6 +11,7 @@ namespace Posegraph;
 ///   GET  /status            插件/Brio/GPose 状态
 ///   GET  /actors            Brio 管理的 GPose 角色列表
 ///   GET  /pose?actor=N      取角色当前姿势（Brio pose JSON），N 为 ObjectIndex，省略则用 GPose 目标
+///   GET  /rig?actor=N       当前角色完整骨架的父子关系与中性参考变换
 ///   POST /pose?actor=N      应用姿势，请求体为 Brio pose JSON；默认先冻结动画，freeze=0 可跳过
 ///   GET  /camera            读取 GPose 相机参数、视图/投影矩阵，以及 GPose 目标的世界位置与朝向
 ///   POST /camera            写入相机参数 {distance, angle[2], pan[2], roll, zoom, delimit}
@@ -77,6 +78,9 @@ public sealed class BridgeServer(IFramework framework, IClientState clientState,
                     break;
                 case ("GET", "/pose"):
                     await HandleGetPose(ctx);
+                    break;
+                case ("GET", "/rig"):
+                    await HandleGetRig(ctx);
                     break;
                 case ("POST", "/pose"):
                     await HandleApplyPose(ctx);
@@ -163,6 +167,21 @@ public sealed class BridgeServer(IFramework framework, IClientState clientState,
         if (!ushort.TryParse(actorParam, out var index))
             return null;
         return brio.GetActors().FirstOrDefault(a => a.ObjectIndex == index);
+    }
+
+    private async Task HandleGetRig(HttpListenerContext ctx)
+    {
+        var actorParam = ctx.Request.QueryString["actor"];
+        var (code, body) = await framework.RunOnFrameworkThread<(int, object)>(() =>
+        {
+            if (!clientState.IsGPosing) return (409, new { error = Loc.T("不在 GPose 中") });
+            var actor = ResolveActor(actorParam);
+            if (actor is null) return (404, new { error = Loc.T("找不到角色") });
+            var pose = brio.GetPose(actor);
+            var rig = pose is null ? null : ActorRigReader.Read(actor, pose);
+            return rig is null ? (409, new { error = "Actor skeleton is not ready" }) : (200, rig);
+        });
+        await WriteJson(ctx, code, body);
     }
 
     private async Task HandleGetPose(HttpListenerContext ctx)

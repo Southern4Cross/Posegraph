@@ -15,6 +15,7 @@ public sealed class RetargetParams
     [JsonPropertyName("upright_max_deg")] public float UprightMaxDeg { get; set; } = 30f;
     [JsonPropertyName("ground")] public bool Ground { get; set; } = true;
     [JsonPropertyName("helper_strength")] public float HelperStrength { get; set; } = 1f;
+    [JsonPropertyName("midlander_female_experiment")] public bool MidlanderFemaleExperiment { get; set; } = false;
 
     public float Amp(string group) => Amplitude.TryGetValue(group, out var v) ? v : 1f;
 
@@ -24,6 +25,7 @@ public sealed class RetargetParams
         Offsets = Offsets.ToDictionary(kv => kv.Key, kv => (float[])kv.Value.Clone()),
         HandStrength = HandStrength, HandNear = HandNear, HandFar = HandFar,
         Upright = Upright, UprightMaxDeg = UprightMaxDeg, Ground = Ground, HelperStrength = HelperStrength,
+        MidlanderFemaleExperiment = MidlanderFemaleExperiment,
     };
 
     public static RetargetParams Preset(string name)
@@ -59,7 +61,8 @@ public sealed record RaceUsed(string Code, string Name, string Group, bool Valid
 public sealed record RetargetResult(
     string Pose, PoseWarning[] Warnings, Dictionary<string, string> Severity,
     JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race, bool ReferenceStale = false,
-    bool? Ivcs = null);   // 游戏角色是否加载了 IVCS 骨骼（读到游戏姿势时才有）
+    bool? Ivcs = null,   // 游戏角色是否加载了 IVCS 骨骼（读到游戏姿势时才有）
+    string? ApplyPose = null, bool FacialOnly = false);
 
 public sealed record CameraResult(float PositionErrorCm, float ForwardErrorDeg, float FovDeg, float TargetFovDeg,
                                   float FramingErrorPct, string[] Log);

@@ -23,6 +23,24 @@ def tr(text: str, **kwargs) -> str:
 
 
 EN = {
+    "模型未返回有效的姿势建议；请重试或更换支持指令的模型": "The model did not return valid pose advice; retry or choose an instruction-following model",
+    "当前姿势无效，请重新导入图像或读取角色姿势": "The current pose is invalid; reimport an image or read the actor pose again",
+    # Prompt pose chat (upstream responses must never expose credentials).
+    "API 端点须为 HTTP(S) 地址，且不能包含凭据、查询参数或片段": "The API endpoint must be an HTTP(S) URL without credentials, query parameters or fragments",
+    "请配置兼容 Chat Completions 的端点（基础地址或 /chat/completions）": "Use a Chat Completions-compatible endpoint (base URL or /chat/completions)",
+    "模型未返回有效的动作 JSON；请重试或更换支持指令的模型": "The model did not return valid pose JSON; retry or choose an instruction-following model",
+    "发送参考图需要先导入并识别一张图片": "Import and recognize an image before sending a reference image",
+    "无法处理参考图，请重新导入图像": "Cannot process the reference image; import it again",
+    "模型服务认证失败；请检查 API 密钥和模型访问权限": "Model authentication failed; check the API key and model access",
+    "模型服务限流或额度不足；请稍后重试并检查额度": "The model service is rate limited or out of credits; retry later and check your quota",
+    "模型服务返回 HTTP {status}；请检查端点、模型名及图像支持": "The model service returned HTTP {status}; check the endpoint, model name and image support",
+    "模型响应过大，请缩小本次动作调整范围": "The model response is too large; request a smaller pose adjustment",
+    "模型请求超时；请稍后重试或使用响应更快的模型": "The model request timed out; retry later or use a faster model",
+    "无法连接模型服务；请检查 API 端点和网络": "Cannot connect to the model service; check the API endpoint and network",
+    "模型响应被截断，请缩小本次动作调整范围": "The model response was truncated; request a smaller pose adjustment",
+    "未知的种族骨架：{code}": "Unknown race skeleton: {code}",
+    "当前姿势无效，请重新导入图像或从默认站姿开始": "The current pose is invalid; reimport an image or start from the default standing pose",
+    "模型提出了无效的骨骼调整，姿势未更改；请重试或缩小调整范围": "The model proposed invalid bone edits; the pose was not changed. Retry or request a smaller adjustment",
     # 合理性提示（tuning.LIMITS 与组合检查）
     "腰部转动过大": "Waist rotation too large",
     "胸背单节转动过大，躯干可能折角": "Chest/back segment rotation too large; the torso may kink",

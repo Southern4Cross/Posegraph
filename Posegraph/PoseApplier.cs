@@ -1,5 +1,6 @@
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
+using Posegraph.Backend;
 
 namespace Posegraph;
 
@@ -17,6 +18,17 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
 
     public Task<string?> GetPoseAsync(int? actor) => framework.RunOnFrameworkThread(() =>
         clientState.IsGPosing && Resolve(actor) is { } a ? brio.GetPose(a) : null);
+
+    public sealed record ActorSnapshot(string Pose, ActorRig? Rig);
+
+    /// <summary>Pose and neutral skeleton are copied from the same actor on the same framework tick.</summary>
+    public Task<ActorSnapshot?> GetSnapshotAsync(int? actor) => framework.RunOnFrameworkThread(() =>
+    {
+        if (!clientState.IsGPosing || Resolve(actor) is not { } a || brio.GetPose(a) is not { } pose) return null;
+        return new ActorSnapshot(pose, ActorRigReader.Read(a, pose));
+    });
+
+    public async Task<ActorRig?> GetRigAsync(int? actor) => (await GetSnapshotAsync(actor))?.Rig;
 
     /// <summary>
     /// 角色"身份"。Key：是哪个角色（ObjectIndex + 类型 + BaseId + 名字，Glamourer 换外貌不变，Brio 删掉再新建会变）；
@@ -41,31 +53,40 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
     public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));
 
     /// <summary>清除 Brio 姿势栈（保留模型位置），等几帧让 Brio 读到的骨骼刷新。</summary>
-    public async Task<bool> ResetPoseAsync(int? actor)
+    public async Task<bool> ResetPoseAsync(int? actor, CancellationToken ct = default)
     {
         var ok = await framework.RunOnFrameworkThread(() =>
-            clientState.IsGPosing && Resolve(actor) is { } a && brio.ResetPoseKeepTransform(a));
+        {
+            ct.ThrowIfCancellationRequested();
+            return clientState.IsGPosing && Resolve(actor) is { } a && brio.ResetPoseKeepTransform(a);
+        });
         if (ok) await framework.DelayTicks(FreezeSettleTicks);
+        ct.ThrowIfCancellationRequested();
         return ok;
     }
 
     /// <summary>冻结动画、等几帧再导入（否则待机动画会让姿势漂移），之后再应用一次。返回错误信息，成功为 null。</summary>
-    public async Task<string?> ApplyAsync(int? actor, string poseJson)
+    public async Task<string?> ApplyAsync(int? actor, string poseJson, CancellationToken ct = default, bool freeze = true)
     {
         var error = await framework.RunOnFrameworkThread(() =>
         {
+            ct.ThrowIfCancellationRequested();
             if (!clientState.IsGPosing) return Loc.T("不在 GPose 中");
             var a = Resolve(actor);
             if (a is null) return Loc.T("找不到角色（请在 GPose 中选中目标）");
-            brio.Freeze(a);
+            if (freeze) brio.Freeze(a);
             return null;
         });
         if (error is not null) return error;
-        await framework.DelayTicks(FreezeSettleTicks);
+        if (freeze) await framework.DelayTicks(FreezeSettleTicks);
         for (var i = 0; i < 2; i++)
         {
             if (i > 0) await framework.DelayTicks(SecondApplyTicks);
-            var ok = await framework.RunOnFrameworkThread(() => Resolve(actor) is { } a && brio.ApplyPose(a, poseJson));
+            var ok = await framework.RunOnFrameworkThread(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Resolve(actor) is { } a && brio.ApplyPose(a, poseJson);
+            });
             if (!ok) return Loc.T("Brio 应用姿势失败");
         }
         return null;
