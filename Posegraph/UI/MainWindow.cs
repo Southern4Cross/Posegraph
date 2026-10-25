@@ -73,6 +73,8 @@ public sealed class MainWindow : Window, IDisposable
     private IDalamudTextureWrap? _newTexture;
     private int _person;
     private RetargetParams _params;
+    private bool _paramsDirty;       // 参数可能变了：松手后与已保存的比较，不同就写入配置
+    private string _savedParams = "";
     private string _preset;
     private volatile RetargetResult? _result;
     private volatile bool _recognizing;
@@ -118,7 +120,8 @@ public sealed class MainWindow : Window, IDisposable
         _client = new BackendClient(() => _config.BackendPort);
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
-        _params = RetargetParams.Preset(_preset);
+        _params = LoadParams(_preset);
+        _savedParams = ParamsSnapshot(_params);
 
         Size = new Vector2(420, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -464,8 +467,39 @@ public sealed class MainWindow : Window, IDisposable
         });
     }
 
+    /// <summary>预设的值：有保存过的用保存的，否则用内置预设。</summary>
+    private RetargetParams LoadParams(string preset)
+    {
+        if (!_config.SavedParams.TryGetValue(preset, out var saved)) return RetargetParams.Preset(preset);
+        var p = saved.Clone();
+        p.Offsets.Clear();
+        return p;
+    }
+
+    private static string ParamsSnapshot(RetargetParams p)
+    {
+        var c = p.Clone();
+        c.Offsets.Clear();
+        return System.Text.Json.JsonSerializer.Serialize(c);
+    }
+
+    /// <summary>调整过的值按预设保存。拖动滑杆时不写，松手后再写。</summary>
+    private void PersistParams()
+    {
+        if (!_paramsDirty || ImGui.IsAnyItemActive()) return;
+        _paramsDirty = false;
+        var snapshot = ParamsSnapshot(_params);
+        if (snapshot == _savedParams) return;
+        var saved = _params.Clone();
+        saved.Offsets.Clear();
+        _config.SavedParams[_preset] = saved;
+        _pi.SavePluginConfig(_config);
+        _savedParams = snapshot;
+    }
+
     private void RequestRetarget(bool push)
     {
+        _paramsDirty = true;
         if (_session is null) return;
         _rtPush |= push;
         if (_rtBusy)
@@ -616,6 +650,7 @@ public sealed class MainWindow : Window, IDisposable
         }
         PollHealth();
         RefreshActors();
+        PersistParams();
         DragSource();
 
         DrawStatusBar();
@@ -1091,19 +1126,22 @@ public sealed class MainWindow : Window, IDisposable
                 {
                     _preset = key;
                     var offsets = _params.Offsets;
-                    _params = RetargetParams.Preset(key);
+                    _params = LoadParams(key);
                     _params.Offsets = offsets;
+                    _savedParams = ParamsSnapshot(_params);
                     _config.DefaultPreset = key;
                     _pi.SavePluginConfig(_config);
                     RequestRetarget(_config.PushOnRelease);
                 }
             ImGui.EndCombo();
         }
-        ItemTip(Loc.T("预设：插画会把颈/头幅度设为 0.7（游戏实测合适）"));
+        ItemTip(Loc.T("预设：插画会把颈/头幅度设为 0.7（游戏实测合适）") + "\n" + Loc.T("调整过的值按预设自动保存，点右边的按钮恢复默认"));
         ImGui.SameLine();
         if (IconButton("##resetAll", FontAwesomeIcon.UndoAlt, Loc.T("全部恢复预设值（含手动偏移）")))
         {
             _params = RetargetParams.Preset(_preset);
+            if (_config.SavedParams.Remove(_preset)) _pi.SavePluginConfig(_config);
+            _savedParams = ParamsSnapshot(_params);
             RequestRetarget(_config.PushOnRelease);
         }
 

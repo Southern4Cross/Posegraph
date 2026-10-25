@@ -1,4 +1,5 @@
 using Dalamud.Configuration;
+using Posegraph.Backend;
 
 namespace Posegraph;
 
@@ -64,4 +65,7 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>新图默认使用的预设：photo / illustration。</summary>
     public string DefaultPreset { get; set; } = "photo";
+
+    /// <summary>每个预设上次调整过的值（不含手动偏移，偏移只对当前图有意义）。</summary>
+    public Dictionary<string, RetargetParams> SavedParams { get; set; } = new();
 }
