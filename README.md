@@ -30,9 +30,7 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 - **Plausibility hints** with one-click fixes, based on ranges sampled from in-game animations.
 - **Hand contact compensation**: hands touching the head / chest / hips stay in contact even when your race's
   proportions differ from the person in the photo; elbows stay pure hinges.
-- **Camera matching**: reproduces the photo's camera angle, distance and field of view in GPose. The view always contains the
-  whole photo frame for your window's aspect ratio (16:9, 16:10, …), and if a body part visible in the photo would end up
-  off-screen, the view is widened or the camera moves back (can be turned off in Settings).
+- **Camera matching**: reproduces the photo's camera angle, distance and field of view in GPose.
 - **Export** Brio `.pose` files.
 - **Low-VRAM friendly**: Auto / GPU / CPU modes, the model is unloaded right after each recognition by default,
   and CPU mode uses no VRAM at all.

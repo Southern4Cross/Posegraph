@@ -60,11 +60,8 @@ public sealed record RetargetResult(
     string Pose, PoseWarning[] Warnings, Dictionary<string, string> Severity,
     JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race);
 
-/// <summary>完整入画的调整：Action 为 none / zoom（拉宽视角）/ dolly（视角到上限后沿视线后退）。</summary>
-public sealed record CameraFit(string Action, float DollyCm, float? FovDeg);
-
 public sealed record CameraResult(float PositionErrorCm, float ForwardErrorDeg, float FovDeg, float TargetFovDeg,
-                                  float FramingErrorPct, string[] Log, CameraFit? Fit);
+                                  float FramingErrorPct, string[] Log);
 
 public sealed record GpuInfo(string Name, int FreeMB, int TotalMB, int UsedMB);
 

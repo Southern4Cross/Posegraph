@@ -59,9 +59,9 @@ public sealed class BackendClient(Func<int> port) : IDisposable
         return (await ReadAsync<RetargetResult>(resp))!;
     }
 
-    public async Task<CameraResult> CameraAsync(string sid, int person, RetargetParams p, int? actor, string? race, bool fit)
+    public async Task<CameraResult> CameraAsync(string sid, int person, RetargetParams p, int? actor, string? race)
     {
-        using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/camera"), new { person, @params = p, actor, race, fit }, Json);
+        using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/camera"), new { person, @params = p, actor, race }, Json);
         return (await ReadAsync<CameraResult>(resp))!;
     }
 
