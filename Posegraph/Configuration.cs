@@ -53,6 +53,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>进入 GPose 且 Brio 就绪时自动打开主界面。</summary>
     public bool AutoOpenInGpose { get; set; } = true;
 
+    /// <summary>复刻镜头时，照片里在画面内的部位在游戏里也保证在画面内（必要时拉宽视角或后退）。</summary>
+    public bool CameraFit { get; set; } = true;
+
     /// <summary>新图识别完成后立即应用到角色。</summary>
     public bool PushAfterRecognize { get; set; }
 

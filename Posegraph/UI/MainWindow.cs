@@ -600,8 +600,15 @@ public sealed class MainWindow : Window, IDisposable
         SetStatus(Loc.T("复刻镜头中（约 10 秒，画面会跳动）…"), Yellow);
         _ = Run(async () =>
         {
-            var r = await _client.CameraAsync(_session.SessionId, _person, _params.Clone(), _actor, _raceOverride ?? _detectedRace);
-            SetStatus(Loc.F("镜头已复刻：机位误差 {0:0.0}cm，构图偏差 {1:0.0}%", r.PositionErrorCm, r.FramingErrorPct), Green);
+            var r = await _client.CameraAsync(_session.SessionId, _person, _params.Clone(), _actor, _raceOverride ?? _detectedRace,
+                                              _config.CameraFit);
+            var fit = r.Fit?.Action switch
+            {
+                "zoom" => Loc.F("，为完整入画拉宽视角到 {0:0}°", r.Fit.FovDeg ?? r.FovDeg),
+                "dolly" => Loc.F("，为完整入画后退 {0:0}cm", r.Fit.DollyCm),
+                _ => "",
+            };
+            SetStatus(Loc.F("镜头已复刻：机位误差 {0:0.0}cm，构图偏差 {1:0.0}%", r.PositionErrorCm, r.FramingErrorPct) + fit, Green);
         });
     }
 
@@ -1348,6 +1355,8 @@ public sealed class MainWindow : Window, IDisposable
         changed |= Check(Loc.T("松开滑杆时自动应用到角色"), _config.PushOnRelease, v => _config.PushOnRelease = v);
         changed |= Check(Loc.T("识别完成后立即应用到角色"), _config.PushAfterRecognize, v => _config.PushAfterRecognize = v);
         changed |= Check(Loc.T("进入 GPose 且 Brio 就绪时自动打开界面"), _config.AutoOpenInGpose, v => _config.AutoOpenInGpose = v);
+        changed |= Check(Loc.T("复刻镜头时保证角色完整入画"), _config.CameraFit, v => _config.CameraFit = v,
+                         Loc.T("照片里拍到的部位（头顶、手、脚等）在游戏里出画时，先拉宽视角，视角到上限后再后退。关掉则严格按照片机位"));
 
         ImGui.Separator();
         ImGui.TextDisabled(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))));

@@ -327,13 +327,14 @@ class CameraRequest(BaseModel):
     params: tuning.RetargetParams = tuning.RetargetParams()
     actor: int | None = None
     race: str | None = None
+    fit: bool = True    # 照片里在画面内的部位在游戏里也保证在画面内
 
 
 @app.post("/sessions/{sid}/camera")
 def session_camera(sid: str, req: CameraRequest) -> dict:
     """需要 Posegraph 的 HTTP 服务在运行（插件会调用本接口，本接口再回调插件读写相机）。"""
     from .bridge import BridgeClient
-    from .camera import framing_error, photo_camera_in_world, solve_gpose_camera
+    from .camera import fit_in_frame, fit_points, framing_error, photo_camera_in_world, solve_gpose_camera
 
     s = _session(sid)
     human = _human(s, req.person)
@@ -347,8 +348,13 @@ def session_camera(sid: str, req: CameraRequest) -> dict:
                                    load_mhr_rest()[0])
     log: list[str] = []
     result = solve_gpose_camera(client, target, log=log.append)
-    framing = framing_error(client, human, BrioPose.loads(client.get_pose(req.actor)), load_mhr_rest()[0])
+    pose_now = BrioPose.loads(client.get_pose(req.actor))
+    fit = {"action": "none"}
+    if req.fit:
+        fit = fit_in_frame(client, target, result, fit_points(human, pose_now, load_mhr_rest()[0]), log=log.append)
+    framing = framing_error(client, human, pose_now, load_mhr_rest()[0])
     return {"positionErrorCm": round(result["position_error_cm"], 1),
+            "fit": {"action": fit["action"], "dollyCm": fit.get("dolly_cm", 0.0), "fovDeg": fit.get("fov_deg")},
             "forwardErrorDeg": round(result["forward_error_deg"], 2),
             "fovDeg": round(result["fov_deg"], 1), "targetFovDeg": round(result["target_fov_deg"], 1),
             "framingErrorPct": round(framing * 100, 1), "log": log}
