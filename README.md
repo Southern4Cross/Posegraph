@@ -69,6 +69,18 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
 2. *Settings* → **Choose backend package folder…** → select the extracted folder.
 3. Click the **plug** icon in the status bar to start the backend. Optionally enable *Start the backend when the plugin loads*.
 
+### Updating
+
+- **Plugin**: updates automatically through the plugin repository.
+- **Backend (package users)**: after the plugin updates, *Settings* shows "Backend …, plugin …". When the backend is older,
+  click the download button next to it. The plugin downloads the matching source from this repository's tag
+  (`archive/refs/tags/vX.Y.Z.zip`, under 1 MB) and replaces only `backend\src`; Python, dependencies and the model stay.
+  The previous version is kept as `backend\src.bak` and restored automatically if the new one fails to start.
+  If GitHub is unreachable, set a mirror prefix such as `https://gh-proxy.org/`.
+- A full package download is only needed when the dependencies change; the plugin tells you
+  (the package's `runtime.json` is older than what the new backend requires).
+- Source installs: update with `git pull` / checkout of the same tag.
+
 ## Usage
 
 1. Enter GPose and select the actor (or pick one in the actor list).
