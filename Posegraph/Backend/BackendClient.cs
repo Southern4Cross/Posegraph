@@ -42,38 +42,54 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     public Task ConfigureAsync(Configuration c) => PostAsync("/model/config",
         new Dictionary<string, object> { ["device"] = c.BackendDevice, ["release_after"] = c.ReleaseAfter, ["mhr_on_cpu"] = c.MhrOnCpu });
 
-    /// <summary>hold：同一批后面还有图要识别，这张识别完后端先不按「立即释放」卸载模型（整批结束再 UnloadModelAsync）。</summary>
-    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, bool hold = false)
+    /// <summary>每批预识别开始前同步并行上限，设备和释放策略保持不变。</summary>
+    public async Task ConfigureRecognitionAsync(int parallelism)
+    {
+        var limit = Math.Clamp(parallelism, 1, 8);
+        using var resp = await _http.PostAsJsonAsync(Url("/model/config"), new { recognition_parallelism = limit }, Json);
+        var body = await ReadAsync<JsonElement>(resp);
+        var confirmed = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("model", out var model) &&
+            model.ValueKind == JsonValueKind.Object && model.TryGetProperty("config", out var config) &&
+            config.ValueKind == JsonValueKind.Object && config.TryGetProperty("recognitionParallelism", out var value) &&
+            value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var actual) && actual == limit;
+        // Older backends serialize inference and ignore this unknown config field.
+        // Accept that only for the default; never present HTTP fan-out as real parallel inference.
+        if (limit > 1 && !confirmed)
+            throw new InvalidOperationException(Loc.T("当前后端不支持并行识别，请更新并重启后端"));
+    }
+
+    /// <summary>hold：批次内先保留模型，所有批次结束后再按释放策略卸载。</summary>
+    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, bool hold = false, CancellationToken ct = default)
     {
         using var content = new ByteArrayContent(image);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}{(hold ? "&hold=true" : "")}"), content);
-        return (await ReadAsync<SessionInfo>(resp))!;
+        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}{(hold ? "&hold=true" : "")}"), content, ct);
+        return (await ReadAsync<SessionInfo>(resp, ct))!;
     }
 
-    public Task<byte[]> SessionImageAsync(string sid) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"));
+    public Task<byte[]> SessionImageAsync(string sid, CancellationToken ct = default) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"), ct);
 
     /// <summary>会话存档（npz），存进图库的识别缓存。</summary>
-    public async Task<byte[]> SessionArchiveAsync(string sid)
+    public async Task<byte[]> SessionArchiveAsync(string sid, CancellationToken ct = default)
     {
-        using var resp = await _http.GetAsync(Url($"/sessions/{sid}/archive"));
-        await EnsureSuccessAsync(resp);
-        return await resp.Content.ReadAsByteArrayAsync();
+        using var resp = await _http.GetAsync(Url($"/sessions/{sid}/archive"), ct);
+        await EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsByteArrayAsync(ct);
     }
 
     /// <summary>从识别缓存恢复会话（不加载模型）。</summary>
-    public async Task<SessionInfo> RestoreSessionAsync(byte[] archive, string name)
+    public async Task<SessionInfo> RestoreSessionAsync(byte[] archive, string name, CancellationToken ct = default)
     {
         using var content = new ByteArrayContent(archive);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions/archive?name={Uri.EscapeDataString(name)}"), content);
-        return (await ReadAsync<SessionInfo>(resp))!;
+        using var resp = await _http.PostAsync(Url($"/sessions/archive?name={Uri.EscapeDataString(name)}"), content, ct);
+        return (await ReadAsync<SessionInfo>(resp, ct))!;
     }
 
-    public async Task DeleteSessionAsync(string sid)
+    public async Task DeleteSessionAsync(string sid, CancellationToken ct = default)
     {
-        using var resp = await _http.DeleteAsync(Url($"/sessions/{sid}"));
-        await EnsureSuccessAsync(resp);
+        using var resp = await _http.DeleteAsync(Url($"/sessions/{sid}"), ct);
+        await EnsureSuccessAsync(resp, ct);
     }
 
     public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race,
@@ -104,16 +120,16 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     }
 
     /// <summary>非 2xx 时把后端 FastAPI 的 detail 作为异常信息抛出。</summary>
-    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp)
+    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp, CancellationToken ct = default)
     {
-        await EnsureSuccessAsync(resp);
-        return await resp.Content.ReadFromJsonAsync<T>(Json);
+        await EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadFromJsonAsync<T>(Json, ct);
     }
 
-    private static async Task EnsureSuccessAsync(HttpResponseMessage resp)
+    private static async Task EnsureSuccessAsync(HttpResponseMessage resp, CancellationToken ct = default)
     {
         if (resp.IsSuccessStatusCode) return;
-        var text = await resp.Content.ReadAsStringAsync();
+        var text = await resp.Content.ReadAsStringAsync(ct);
         string detail = text;
         try { detail = JsonDocument.Parse(text).RootElement.GetProperty("detail").ToString(); } catch { }
         throw new BackendException((int)resp.StatusCode, Loc.F("后端返回 {0}：{1}", (int)resp.StatusCode, detail));

@@ -19,7 +19,7 @@ namespace Posegraph.UI;
 /// 主界面：状态栏 → 选图识别 → 图像叠加 / 3D 火柴人 / 调整 / 提示 / 设置 → 应用、镜头、还原、导出。
 /// 识别只做一次（后端缓存），调参只重跑重定向；拖动滑杆时只刷新预览，松手才应用到角色（Brio 撤销历史保持干净）。
 /// </summary>
-public sealed class MainWindow : Window, IDisposable
+public sealed partial class MainWindow : Window, IDisposable
 {
     private static readonly Vector4 Green = PosegraphTheme.Green;
     private static readonly Vector4 Yellow = PosegraphTheme.Yellow;
@@ -141,7 +141,7 @@ public sealed class MainWindow : Window, IDisposable
         _server = server;
         _client = new BackendClient(() => _config.BackendPort);
         Library = new ImageLibrary(pi.GetPluginConfigDirectory());
-        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0);
+        Recognition = new RecognitionService(Library, _client, () => _config.BatchRecognitionParallelism, () => _config.ReleaseAfter == 0);
         Library.AuxChanged += OnAuxChanged;
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
@@ -174,9 +174,10 @@ public sealed class MainWindow : Window, IDisposable
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
+        Library.AuxChanged -= OnAuxChanged;
         Recognition.Dispose();
         Library.Save();
-        _client.Dispose();
+        _ = Recognition.Completion.ContinueWith(t => { _ = t.Exception; _client.Dispose(); }, TaskScheduler.Default);
         _updater.Dispose();
         _texture?.Dispose();
         _newTexture?.Dispose();
@@ -1953,6 +1954,7 @@ public sealed class MainWindow : Window, IDisposable
         ItemTip(Loc.T("释放后显存/内存归还给游戏，下次识别重新加载（约 5~10 秒）。\nGPU 模式用过一次后，CUDA 运行时会常驻少量显存，直到后端退出"));
         using (ImRaii.Disabled(_config.BackendDevice == "cpu"))
             changed |= Check(Loc.T("GPU 模式下 MHR 放 CPU"), _config.MhrOnCpu, v => _config.MhrOnCpu = v, Loc.T("显存约省 750MB，结果一致，每张约慢 0.5 秒"));
+        changed |= DrawRecognitionConcurrencySettings();
         return changed;
     }
 

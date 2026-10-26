@@ -8,104 +8,185 @@ public enum RecognitionState { Queued, Running, Done, Failed }
 public sealed record RecognitionStatus(RecognitionState State, string? Error = null);
 
 /// <summary>
-/// 识别与识别缓存：同一张图（按内容）识别过就从缓存恢复会话，不再跑模型；批量识别按队列逐张进行（后端一次只跑一个模型）。
-/// releaseImmediately：模型释放策略是「识别后立即释放」（批量结束时由这里卸载，见 Batch）。
+/// Content-hash recognition cache and bounded batch queue. Opening a completed
+/// library item restores its archive while other selected images keep running.
 /// </summary>
-public sealed class RecognitionService(ImageLibrary library, BackendClient client, Func<bool> releaseImmediately) : IDisposable
+public sealed class RecognitionService(ImageLibrary library, BackendClient client, Func<int>? parallelism = null,
+                                       Func<bool>? releaseImmediately = null) : IDisposable
 {
     private readonly ConcurrentQueue<string> _queue = new();
     private readonly ConcurrentDictionary<string, RecognitionStatus> _status = new(StringComparer.OrdinalIgnoreCase);
+    // The library uses one temporary archive filename per hash. Serialize all
+    // foreground/background access to the same content, including duplicate paths.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _contentGates = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _cts = new();
-    private int _worker;
-    private int _batches;   // 进行中的批次数：大于 0 时识别请求带 hold，模型不在每张之后卸载
-    private int _held;      // 本轮批次里真的跑过模型（结束时才需要卸载）
+    private readonly object _sync = new();
+    private readonly HashSet<Task> _opens = [];
+    private Task _work = Task.CompletedTask;
+    private Task _release = Task.CompletedTask;
+    private int _batches;
+    private bool _held;
+    private bool _worker, _disposed;
 
-    /// <summary>
-    /// 批量识别范围（主图 + 辅助视角、拆分模式全部应用、批量队列）：范围内模型只加载一次。
-    /// 释放策略为「立即释放」时，所有批次都结束后卸载一次；其他策略照常按空闲时间释放。可以嵌套、并行。
-    /// </summary>
+    /// <summary>主图、辅助视角或一批图片共用模型；立即释放时等所有批次结束再卸载。</summary>
     public IAsyncDisposable Batch()
     {
-        Interlocked.Increment(ref _batches);
-        return new BatchScope(this);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _batches++;
+            var scope = new BatchScope(this);
+            _opens.Add(scope.Finished.Task);
+            return scope;
+        }
     }
 
     private sealed class BatchScope(RecognitionService owner) : IAsyncDisposable
     {
+        public readonly TaskCompletionSource Finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _done;
-
-        public ValueTask DisposeAsync() => Interlocked.Exchange(ref _done, 1) == 1 ? ValueTask.CompletedTask : owner.EndBatchAsync();
+        public ValueTask DisposeAsync() => Interlocked.Exchange(ref _done, 1) == 1
+            ? ValueTask.CompletedTask : new(owner.EndBatchAsync(this));
     }
 
-    private async ValueTask EndBatchAsync()
+    private async Task EndBatchAsync(BatchScope scope)
     {
-        if (Interlocked.Decrement(ref _batches) > 0 || Interlocked.Exchange(ref _held, 0) == 0 || !releaseImmediately()) return;
         try
         {
-            await client.UnloadModelAsync();
+            Task release;
+            lock (_sync)
+            {
+                if (--_batches == 0 && _held)
+                {
+                    _held = false;
+                    if (releaseImmediately?.Invoke() == true) _release = UnloadAsync();
+                }
+                release = _release;
+            }
+            await release;
         }
-        catch
+        finally
         {
-            // 后端没响应时它自己会在空闲一分钟后释放
+            lock (_sync)
+            {
+                scope.Finished.TrySetResult();
+                _opens.Remove(scope.Finished.Task);
+            }
         }
     }
 
-    private Task<SessionInfo> CreateAsync(byte[] bytes, string name)
+    private async Task UnloadAsync()
     {
-        var hold = Volatile.Read(ref _batches) > 0;
-        if (hold) Interlocked.Exchange(ref _held, 1);
-        return client.CreateSessionAsync(bytes, name, hold);
+        try { await client.UnloadModelAsync(); }
+        catch { /* The backend also releases an abandoned hold after its idle timeout. */ }
+    }
+
+    private async Task<SessionInfo> CreateAsync(byte[] bytes, string name)
+    {
+        Task release;
+        bool hold;
+        lock (_sync)
+        {
+            release = _release;
+            hold = _batches > 0;
+            if (hold) _held = true;
+        }
+        // A newly opened batch must not race the preceding batch's unload.
+        await release;
+        return await client.CreateSessionAsync(bytes, name, hold);
     }
 
     public int Pending => _queue.Count;
-    public bool Busy => Volatile.Read(ref _worker) != 0;
+    public bool Busy { get { lock (_sync) return _worker; } }
+    public Task Completion
+    {
+        get { lock (_sync) return Task.WhenAll(_opens.Append(_work)); }
+    }
 
-    /// <summary>识别完成一张（批量队列里的）：path、是否成功。</summary>
     public event Action<string, bool>? Completed;
-
     public RecognitionStatus? Status(string path) => _status.GetValueOrDefault(path);
 
-    /// <summary>打开一张图：有缓存就恢复，没有（或 force）就识别并写入缓存。返回会话与内容哈希。</summary>
-    public async Task<(SessionInfo Info, string Sha1)> OpenAsync(string path, bool force = false)
+    public Task<(SessionInfo Info, string Sha1)> OpenAsync(string path, bool force = false)
+        => Track(() => OpenCoreAsync(path, force));
+
+    private Task<T> Track<T>(Func<Task<T>> operation)
     {
-        var bytes = await File.ReadAllBytesAsync(path);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var task = operation();
+            _opens.Add(task);
+            _ = task.ContinueWith(t => { lock (_sync) _opens.Remove(t); },
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            return task;
+        }
+    }
+
+    private async Task<(SessionInfo Info, string Sha1)> OpenCoreAsync(string path, bool force)
+    {
+        var bytes = await File.ReadAllBytesAsync(path, _cts.Token);
         var sha1 = library.RememberHash(path, bytes);
         var name = Path.GetFileNameWithoutExtension(path);
-        if (!force && library.ReadCache(sha1) is { } archive)
-        {
-            try
-            {
-                return (await client.RestoreSessionAsync(archive, name), sha1);
-            }
-            catch (BackendException ex) when (ex.StatusCode == 400)
-            {
-                library.DeleteCache(sha1);   // 缓存坏了或格式过时：重新识别
-            }
-        }
-        var info = await CreateAsync(bytes, name);
+        var gate = _contentGates.GetOrAdd(sha1, _ => new SemaphoreSlim(1));
+        await gate.WaitAsync(_cts.Token);
+        SessionInfo? info = null;
         try
         {
-            library.WriteCache(sha1, await client.SessionArchiveAsync(info.SessionId));
+            if (!force && library.ReadCache(sha1) is { } archive)
+            {
+                try { info = await client.RestoreSessionAsync(archive, name); }
+                catch (BackendException ex) when (ex.StatusCode == 400) { library.DeleteCache(sha1); }
+            }
+            if (info is null)
+            {
+                // Keep inference alive through disposal so its returned session
+                // can be deleted; cancellation only skips work not yet started.
+                info = await CreateAsync(bytes, name);
+                try { library.WriteCache(sha1, await client.SessionArchiveAsync(info.SessionId)); }
+                catch { /* A failed cache write must not prevent foreground use. */ }
+            }
+            if (_cts.IsCancellationRequested)
+            {
+                await DeleteSessionAsync(info.SessionId);
+                throw new OperationCanceledException(_cts.Token);
+            }
+            _status[path] = new RecognitionStatus(RecognitionState.Done);
+            library.Save();
+            return (info, sha1);
         }
-        catch
+        finally { gate.Release(); }
+    }
+
+    public Task<SessionInfo?> RestoreAsync(string sha1, string name)
+        => Track(() => RestoreCoreAsync(sha1, name));
+
+    private async Task<SessionInfo?> RestoreCoreAsync(string sha1, string name)
+    {
+        var gate = _contentGates.GetOrAdd(sha1, _ => new SemaphoreSlim(1));
+        await gate.WaitAsync(_cts.Token);
+        try
         {
-            // 缓存写不进去不影响这次使用
+            if (library.ReadCache(sha1) is not { } archive) return null;
+            var session = await client.RestoreSessionAsync(archive, name);
+            if (_cts.IsCancellationRequested)
+            {
+                await DeleteSessionAsync(session.SessionId);
+                throw new OperationCanceledException(_cts.Token);
+            }
+            return session;
         }
-        _status[path] = new RecognitionStatus(RecognitionState.Done);
-        library.Save();
-        return (info, sha1);
+        finally { gate.Release(); }
     }
 
     private readonly ConcurrentDictionary<string, AuxView> _views = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>辅助视角图上次融合时识别出的视角（菜单里显示）；还没融合过返回 null。</summary>
+    /// <summary>辅助视角图上次融合时识别出的视角；还没融合过返回 null。</summary>
     public AuxView? ViewOf(string auxPath) => _views.GetValueOrDefault(auxPath);
 
-    /// <summary>
-    /// 把主图挂着的辅助视角图（没识别过的先识别，结果同样进识别缓存）融合进主图的会话，之后的重定向默认用融合结果。
-    /// 没有辅助图时清掉会话里的融合结果。辅助图的会话用完就删。返回 (辅助图路径, 视角) 列表。
-    /// </summary>
-    public async Task<(string Path, AuxView View)[]> AttachAuxAsync(string sid, string sha1)
+    public Task<(string Path, AuxView View)[]> AttachAuxAsync(string sid, string sha1)
+        => Track(() => AttachAuxCoreAsync(sid, sha1));
+
+    private async Task<(string Path, AuxView View)[]> AttachAuxCoreAsync(string sid, string sha1)
     {
         await using var batch = Batch();
         var aux = library.AuxImages(sha1);
@@ -121,91 +202,149 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
         }
         finally
         {
-            foreach (var s in sessions)
-                _ = client.DeleteSessionAsync(s).ContinueWith(_ => { });
+            foreach (var session in sessions) await DeleteSessionAsync(session);
         }
     }
 
-    /// <summary>会话丢了（后端重启、被挤出）时用缓存恢复；没有缓存返回 null。</summary>
-    public async Task<SessionInfo?> RestoreAsync(string sha1, string name)
-        => library.ReadCache(sha1) is { } archive ? await client.RestoreSessionAsync(archive, name) : null;
-
-    /// <summary>加入批量识别队列（已在队列或已有缓存的跳过）。</summary>
     public void Enqueue(IEnumerable<string> paths)
     {
-        foreach (var path in paths)
+        lock (_sync)
         {
-            if (_status.TryGetValue(path, out var s) && s.State is RecognitionState.Queued or RecognitionState.Running) continue;
-            _status[path] = new RecognitionStatus(RecognitionState.Queued);
-            _queue.Enqueue(path);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            foreach (var path in paths)
+            {
+                if (_status.TryGetValue(path, out var state) && state.State is RecognitionState.Queued or RecognitionState.Running) continue;
+                _status[path] = new RecognitionStatus(RecognitionState.Queued);
+                _queue.Enqueue(path);
+            }
+            if (!_worker && !_queue.IsEmpty) StartWorker();
         }
-        if (Interlocked.CompareExchange(ref _worker, 1, 0) == 0)
-            _ = Task.Run(WorkAsync);
     }
 
-    /// <summary>清空还没开始的；正在识别的那张会做完。</summary>
+    private void StartWorker()
+    {
+        _worker = true;
+        var limit = Math.Clamp(parallelism?.Invoke() ?? 1, 1, 8);
+        _work = Task.Run(() => WorkAsync(limit));
+    }
+
     public void CancelPending()
     {
-        while (_queue.TryDequeue(out var path))
-            _status.TryRemove(path, out _);
+        lock (_sync)
+            while (_queue.TryDequeue(out var path)) _status.TryRemove(path, out _);
     }
 
-    private async Task WorkAsync()
+    private async Task WorkAsync(int limit)
     {
         try
         {
-            await using var batch = Batch();   // 整个队列只加载一次模型
-            while (!_cts.IsCancellationRequested && _queue.TryDequeue(out var path))
+            await using var batch = Batch();
+            await client.ConfigureRecognitionAsync(limit);
+            await Task.WhenAll(Enumerable.Range(0, limit).Select(_ => WorkSlotAsync()));
+        }
+        catch (Exception ex)
+        {
+            while (_queue.TryDequeue(out var path))
             {
-                if (!_status.ContainsKey(path)) continue;   // 已取消
-                _status[path] = new RecognitionStatus(RecognitionState.Running);
-                var ok = false;
-                try
-                {
-                    var bytes = await File.ReadAllBytesAsync(path, _cts.Token);
-                    var sha1 = library.RememberHash(path, bytes);
-                    // 挂着的辅助视角图一起识别，打开时不用再等
-                    foreach (var file in library.AuxImages(sha1).Prepend(path))
-                    {
-                        var data = file == path ? bytes : await File.ReadAllBytesAsync(file, _cts.Token);
-                        var hash = file == path ? sha1 : library.RememberHash(file, data);
-                        if (library.HasCache(hash)) continue;
-                        var info = await CreateAsync(data, Path.GetFileNameWithoutExtension(file));
-                        library.WriteCache(hash, await client.SessionArchiveAsync(info.SessionId));
-                        await client.DeleteSessionAsync(info.SessionId);   // 批量识别的会话不留在后端，免得挤掉当前图
-                    }
-                    _status[path] = new RecognitionStatus(RecognitionState.Done);
-                    ok = true;
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    _status[path] = new RecognitionStatus(RecognitionState.Failed, ex.Message);
-                }
-                library.Save();
-                Completed?.Invoke(path, ok);
+                _status[path] = new RecognitionStatus(RecognitionState.Failed, ex.Message);
+                Notify(path, false);
             }
         }
         finally
         {
-            Volatile.Write(ref _worker, 0);
-            if (!_queue.IsEmpty && !_cts.IsCancellationRequested && Interlocked.CompareExchange(ref _worker, 1, 0) == 0)
-                _ = Task.Run(WorkAsync);
+            lock (_sync)
+            {
+                _worker = false;
+                if (!_queue.IsEmpty && !_disposed) StartWorker();
+            }
         }
     }
 
-    /// <summary>文件改名 / 移动后，状态跟着走。</summary>
+    private async Task WorkSlotAsync()
+    {
+        while (!_cts.IsCancellationRequested && _queue.TryDequeue(out var path))
+        {
+            if (!_status.ContainsKey(path)) continue;
+            _status[path] = new RecognitionStatus(RecognitionState.Running);
+            var ok = false;
+            try
+            {
+                var bytes = await File.ReadAllBytesAsync(path, _cts.Token);
+                var sha1 = library.RememberHash(path, bytes);
+                // Preserve 0.4's auxiliary-view pre-recognition and cache reuse.
+                foreach (var file in library.AuxImages(sha1).Prepend(path))
+                {
+                    var data = file == path ? bytes : await File.ReadAllBytesAsync(file, _cts.Token);
+                    var hash = file == path ? sha1 : library.RememberHash(file, data);
+                    var gate = _contentGates.GetOrAdd(hash, _ => new SemaphoreSlim(1));
+                    await gate.WaitAsync(_cts.Token);
+                    try
+                    {
+                        if (!library.HasCache(hash))
+                        {
+                            SessionInfo? session = null;
+                            try
+                            {
+                                session = await CreateAsync(data, Path.GetFileNameWithoutExtension(file));
+                                library.WriteCache(hash, await client.SessionArchiveAsync(session.SessionId));
+                            }
+                            finally
+                            {
+                                if (session is not null) await DeleteSessionAsync(session.SessionId);
+                            }
+                        }
+                    }
+                    finally { gate.Release(); }
+                }
+                _status[path] = new RecognitionStatus(RecognitionState.Done);
+                ok = true;
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                _status.TryRemove(path, out _);
+                return;
+            }
+            catch (Exception ex) { _status[path] = new RecognitionStatus(RecognitionState.Failed, ex.Message); }
+            library.Save();
+            Notify(path, ok);
+        }
+    }
+
+    private async Task DeleteSessionAsync(string sid)
+    {
+        try { await client.DeleteSessionAsync(sid); }
+        catch { /* Restarted/stopped backends have already discarded the session. */ }
+    }
+
+    private void Notify(string path, bool ok)
+    {
+        // Dispose waits for a callback already being dispatched, and after it
+        // returns no UI subscriber can be invoked by late inference completions.
+        lock (_sync)
+        {
+            foreach (var callback in Completed?.GetInvocationList() ?? [])
+            {
+                if (_disposed) return;
+                try { ((Action<string, bool>)callback)(path, ok); }
+                catch { /* A UI subscriber cannot terminate other recognition jobs. */ }
+            }
+        }
+    }
+
     public void Rename(string from, string to)
     {
-        if (_status.TryRemove(from, out var s)) _status[to] = s;
+        if (_status.TryRemove(from, out var state)) _status[to] = state;
     }
 
     public void Dispose()
     {
-        _cts.Cancel();
-        CancelPending();
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _cts.Cancel();
+            CancelPending();
+            _ = Completion.ContinueWith(t => { _ = t.Exception; _cts.Dispose(); }, TaskScheduler.Default);
+        }
     }
 }

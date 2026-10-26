@@ -72,8 +72,11 @@ public sealed class ImageLibrary
     public string CacheDir { get; }
 
     public ImageLibrary(string configDir)
+        : this(configDir, Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)) { }
+
+    // The public constructor retains the user's Documents layout; checks use an isolated root.
+    internal ImageLibrary(string configDir, string docs)
     {
-        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
         Root = System.IO.Path.Combine(docs, "Posegraph", "Images");
         CacheDir = System.IO.Path.Combine(docs, "Posegraph", "Cache");
         Directory.CreateDirectory(Root);
@@ -215,22 +218,21 @@ public sealed class ImageLibrary
 
     public void Save()
     {
-        string json;
+        // Concurrent recognition completions and UI edits share one ordered write.
+        // Keep snapshot and atomic replacement under the same lock so an older
+        // snapshot cannot overwrite a newer index or race on library.json.tmp.
         lock (_lock)
         {
             if (!_dirty) return;
-            _dirty = false;
-            json = JsonSerializer.Serialize(_index, Json);
-        }
-        try
-        {
-            var tmp = _indexPath + ".tmp";
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, _indexPath, true);
-        }
-        catch
-        {
-            lock (_lock) _dirty = true;   // 下次再存
+            try
+            {
+                var json = JsonSerializer.Serialize(_index, Json);
+                var tmp = _indexPath + ".tmp";
+                File.WriteAllText(tmp, json);
+                File.Move(tmp, _indexPath, true);
+                _dirty = false;
+            }
+            catch { _dirty = true; }
         }
     }
 

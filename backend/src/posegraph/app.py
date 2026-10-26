@@ -8,6 +8,7 @@
   POST /model/config                   设备（auto/cuda/cpu）、释放策略（识别后空闲多少秒释放，0 立即、-1 常驻）、MHR 是否放 CPU
   POST /sessions?name=xx               请求体为图片原始字节（jpg/png/webp/bmp/gif 首帧/tiff/avif），识别一次并缓存
   GET  /sessions/{id}/image            预览图（PNG，长边不超过 1280）
+  DELETE /sessions/{id}                删除图片及预识别缓存
   POST /sessions/{id}/retarget         按参数重定向（只算重定向，几十毫秒），返回 Brio 姿势、叠加层、火柴人、合理性提示
   POST /sessions/{id}/camera           按照片镜头设置 GPose 相机（经 Posegraph HTTP 闭环求解）
   POST /sessions/{id}/views            挂上辅助视角（别的会话里识别好的同一姿势），重定向默认用融合结果（multiview.py）
@@ -24,14 +25,12 @@ import io
 import threading
 import time
 import uuid
-from collections import OrderedDict
-from dataclasses import dataclass
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import session_archive, tuning
 from .config import SERVICE_ROOT, settings
@@ -42,13 +41,20 @@ from .i18n import set_language, tr
 from .retarget import races
 from .retarget.brio_pose import BrioPose
 from .retarget.ffxiv import load_mhr_rest, to_brio_pose_json
+from .session_cache import Session, SessionCache
+from .shared_inference import InferenceFailure, ModelLifecycle, SharedInferencePool
+from .i18n import _lang
 
 app = FastAPI(title="posegraph", version=__version__)
 _estimator = create_estimator()
-# 加载、推理、释放互斥（释放不能打断正在进行的识别）
+# 默认单模型串行；并行时共享权重，加载/配置/释放等待正在运行的识别。
 _model_lock = threading.RLock()
+_model_lifecycle = ModelLifecycle()
 _model_state = {"loading": False, "error": None}
 _release_after = settings.release_after
+_recognition_parallelism = settings.recognition_parallelism
+_parallel_pool: SharedInferencePool | None = None
+_active_pool_requests = 0
 _last_used = time.monotonic()
 # 插件批量识别（主图 + 辅助视角、拆分模式全部应用、批量队列）时请求带 hold：这张识别完先不释放，
 # 整批结束插件再调 /model/unload。插件中途退出没调时，按 HOLD_TIMEOUT 秒空闲兜底释放
@@ -60,19 +66,8 @@ MAX_SESSIONS = 8
 OUTPUTS = SERVICE_ROOT / "outputs" / "ui"
 
 
-@dataclass
-class Session:
-    id: str
-    name: str
-    image_size: tuple[int, int]
-    preview_png: bytes
-    humans: list[dict]          # 键同 image_to_pose 的 npz
-    inference_ms: float
-    fused: dict | None = None   # 挂了辅助视角时第 0 人的融合结果
-    views: list | None = None   # 各辅助视角的说明（multiview.describe）
-
-
-_sessions: OrderedDict[str, Session] = OrderedDict()
+# 大批图片只保留最近使用的 8 份在内存，其余暂存磁盘；选择时直接恢复，不再推理。
+_sessions = SessionCache(MAX_SESSIONS)
 
 
 @app.middleware("http")
@@ -82,7 +77,7 @@ async def _language(request: Request, call_next):
     return await call_next(request)
 
 
-def _load_model() -> None:
+def _load_serial_model() -> None:
     with _model_lock:
         if _estimator.loaded:
             return
@@ -96,35 +91,107 @@ def _load_model() -> None:
             _model_state["loading"] = False
 
 
+def _shared_config() -> dict:
+    return {key: getattr(_estimator, key) for key in
+            ("device", "precision", "share_mhr", "mhr_on_cpu", "min_free_vram_mb")
+            if hasattr(_estimator, key)}
+
+
+def _uses_shared_pool() -> bool:
+    return _recognition_parallelism > 1
+
+
+def _get_parallel_pool() -> SharedInferencePool:
+    global _parallel_pool
+    with _model_lock:
+        if _parallel_pool is None:
+            _parallel_pool = SharedInferencePool(_recognition_parallelism, _shared_config())
+        return _parallel_pool
+
+
+def _close_parallel_pool() -> None:
+    global _parallel_pool
+    if _parallel_pool is not None:
+        _parallel_pool.close()
+        _parallel_pool = None
+
+
+def _load_model() -> None:
+    with _model_lifecycle.exclusive():
+        if not _uses_shared_pool():
+            _load_serial_model()
+        else:
+            _model_state.update(loading=True, error=None)
+            try:
+                _get_parallel_pool().preload(_lang.get())
+            except Exception as error:
+                _model_state["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                _model_state["loading"] = False
+
+
 def _unload_model() -> None:
     global _held
-    with _model_lock:
+    with _model_lifecycle.exclusive(), _model_lock:
+        _close_parallel_pool()
         _estimator.unload()
         _held = False
 
 
 def _release_loop() -> None:
     """按策略释放模型：识别后空闲超过 release_after 秒就卸载（0 在识别结束时立即卸载，见 _estimate）。"""
-    global _held
     while True:
         time.sleep(2)
-        limit = lambda: HOLD_TIMEOUT if _release_after == 0 and _held else _release_after
-        idle = lambda: (limit() > 0 and _estimator.loaded and not _model_state["loading"]
-                        and time.monotonic() - _last_used > limit())
-        if idle():
-            with _model_lock:   # 拿到锁时可能刚识别完，再判断一次
-                if idle():
+        try:
+            _release_idle_models()
+        except Exception:
+            pass  # The failed cleanup remains visible in model health; retry next tick.
+
+
+def _release_idle_models() -> None:
+    global _held
+    def idle():
+        limit = HOLD_TIMEOUT if _release_after == 0 and _held else _release_after
+        info = _model_info()
+        closing = any(state.get("closing") for state in info.get("workers", []))
+        return not info["loading"] and (closing or
+            limit > 0 and info["loaded"] and time.monotonic() - _last_used > limit)
+    if idle():
+        with _model_lifecycle.exclusive(), _model_lock:
+            if idle():
+                try:
+                    _close_parallel_pool()
                     _estimator.unload()
-                    _held = False
+                except Exception as error:
+                    _model_state["error"] = f"{type(error).__name__}: {error}"
+                    raise
+                _held = False
+                _model_state["error"] = None
 
 
 def _model_info() -> dict:
-    return {"loaded": _estimator.loaded, "loading": _model_state["loading"], "error": _model_state["error"],
+    info = {"loaded": _estimator.loaded, "loading": _model_state["loading"], "error": _model_state["error"],
             "device": getattr(_estimator, "active_device", None), "precision": getattr(_estimator, "active_precision", None),
             "deviceReason": _reason(getattr(_estimator, "device_reason", ("",))),
             "config": {"device": getattr(_estimator, "device", None), "releaseAfter": _release_after,
                        "mhrOnCpu": getattr(_estimator, "mhr_on_cpu", None),
-                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None)}}
+                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None),
+                       "recognitionParallelism": _recognition_parallelism},
+            "modelCopies": int(_estimator.loaded)}
+    pool = _parallel_pool
+    if _uses_shared_pool():
+        states = pool.states if pool is not None else []
+        active = next((state for state in states if state["loaded"]), None)
+        info.update(loaded=any(state["loaded"] for state in states),
+                    loading=_model_state["loading"] or any(state["loading"] for state in states),
+                    error=next((state["error"] for state in states if state["error"]), _model_state["error"]),
+                    workers=states, activeInferences=_model_lifecycle.active,
+                    modelCopies=sum(bool(state["loaded"]) for state in states))
+        if active:
+            info.update(device=active["device"], precision=active["precision"],
+                        deviceReason=_reason(active["device_reason"]))
+    return info
 
 
 def _reason(r) -> str:
@@ -143,7 +210,8 @@ def health() -> dict:
 
 @app.post("/model/load")
 def model_load() -> dict:
-    if not _estimator.loaded and not _model_state["loading"]:
+    info = _model_info()
+    if not info["loaded"] and not info["loading"]:
         threading.Thread(target=lambda: _safe(_load_model), daemon=True).start()
     return {"model": _model_info()}
 
@@ -166,23 +234,30 @@ class ModelConfig(BaseModel):
     release_after: float | None = None  # 秒；0 立即释放，-1 常驻
     mhr_on_cpu: bool | None = None
     min_free_vram_mb: int | None = None
+    recognition_parallelism: int | None = Field(default=None, ge=1, le=8, strict=True)
 
 
 @app.post("/model/config")
 def model_config(cfg: ModelConfig) -> dict:
     """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。"""
-    global _release_after
+    global _release_after, _recognition_parallelism, _held
     if cfg.device is not None and cfg.device not in ("auto", "cuda", "cpu"):
         raise HTTPException(400, tr("device 只能是 auto / cuda / cpu"))
-    with _model_lock:
-        reload = False
-        for key in ("device", "mhr_on_cpu", "min_free_vram_mb"):
-            value = getattr(cfg, key)
-            if value is not None and getattr(_estimator, key) != value:
-                setattr(_estimator, key, value)
-                reload = True
-        if reload and _estimator.loaded:
+    with _model_lifecycle.exclusive(), _model_lock:
+        changes = {key: getattr(cfg, key) for key in ("device", "mhr_on_cpu", "min_free_vram_mb")
+                   if getattr(cfg, key) is not None and getattr(_estimator, key) != getattr(cfg, key)}
+        next_parallelism = cfg.recognition_parallelism if cfg.recognition_parallelism is not None else _recognition_parallelism
+        reload = bool(changes) or next_parallelism != _recognition_parallelism
+        if reload:
+            # close() may fail after blocking new leases. Preserve both the old
+            # configuration and pool handle so retrying this exact request will
+            # attempt shutdown again, instead of treating it as a no-op update.
+            _close_parallel_pool()
             _estimator.unload()
+            _held = False
+        for key, value in changes.items():
+            setattr(_estimator, key, value)
+        _recognition_parallelism = next_parallelism
         if cfg.release_after is not None:
             _release_after = cfg.release_after
     return {"model": _model_info()}
@@ -216,11 +291,10 @@ def _preview_png(rgb: np.ndarray) -> bytes:
 
 
 def _session(sid: str) -> Session:
-    s = _sessions.get(sid)
-    if s is None:
+    try:
+        return _sessions[sid]
+    except KeyError:
         raise HTTPException(404, tr("会话不存在（后端重启过？请重新识别）"))
-    _sessions.move_to_end(sid)
-    return s
 
 
 @app.post("/sessions")
@@ -238,7 +312,7 @@ async def create_session(request: Request, name: str = "image", hold: bool = Fal
                        "keypoints_2d": h.keypoints_2d, "focal_length": h.focal_length, "cam_t": h.cam_t,
                        "bbox": h.bbox, "image_size": np.array(result.image_size),
                        "vertices": h.extra["vertices"], "rest_vertices": h.extra["rest_vertices"]})
-    session = _add_session(name, result.image_size, _preview_png(rgb), humans, result.timings_ms["inference"])
+    session = await run_in_threadpool(_add_session, name, result.image_size, _preview_png(rgb), humans, result.timings_ms["inference"])
 
     if settings.save_sessions:   # 存一份 npz，命令行脚本（push_pose / preview_overlay / Blender 对比）可直接复用
         OUTPUTS.mkdir(parents=True, exist_ok=True)
@@ -251,8 +325,6 @@ def _add_session(name: str, image_size, preview_png: bytes, humans: list[dict], 
     sid = uuid.uuid4().hex[:12]
     session = Session(sid, name, tuple(image_size), preview_png, humans, inference_ms)
     _sessions[sid] = session
-    while len(_sessions) > MAX_SESSIONS:
-        _sessions.popitem(last=False)
     return session
 
 
@@ -279,31 +351,58 @@ async def session_archive_restore(request: Request, name: str | None = None) -> 
         raise HTTPException(400, tr("识别缓存无法读取：{error}", error=ex))
     if not a["humans"]:
         raise HTTPException(400, tr("识别缓存无法读取：{error}", error="humans"))
-    session = _add_session(name or a["name"], a["image_size"], a["preview_png"], a["humans"], a["inference_ms"])
+    session = await run_in_threadpool(_add_session, name or a["name"], a["image_size"], a["preview_png"], a["humans"], a["inference_ms"])
     return _session_info(session, None)
 
 
 @app.delete("/sessions/{sid}")
 def session_delete(sid: str) -> dict:
-    _sessions.pop(sid, None)
+    _sessions.discard(sid)
     return {"ok": True}
 
 
 def _estimate(data: bytes, hold: bool = False):
-    global _last_used, _held
+    global _last_used, _held, _active_pool_requests
     rgb = _decode(data)
-    with _model_lock:
-        try:
-            _load_model()
-        except Exception as ex:
-            raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
-        try:
-            result = _estimator.estimate(rgb)
-        finally:
-            _last_used = time.monotonic()
-            _held = hold
-            if _release_after == 0 and not hold:
-                _estimator.unload()
+    with _model_lifecycle.inference():
+        if _uses_shared_pool():
+            with _model_lock:
+                if not _active_pool_requests:
+                    _held = False
+                _active_pool_requests += 1
+                # A held batch request protects the whole concurrent group.
+                # Non-held peers cannot release a model still used by the batch.
+                _held |= hold
+            try:
+                try:
+                    previous_load_error = _model_state["error"]
+                    result = _get_parallel_pool().estimate(rgb, language=_lang.get())
+                    # A successful retry supersedes an earlier preload failure.
+                    # Keep a newer global error and every per-worker/pool error.
+                    with _model_lock:
+                        if _model_state["error"] == previous_load_error:
+                            _model_state["error"] = None
+                except InferenceFailure as error:
+                    raise HTTPException(error.status, str(error)) from error
+            finally:
+                with _model_lock:
+                    _active_pool_requests -= 1
+                    _last_used = time.monotonic()
+                    if not _active_pool_requests and _release_after == 0 and not _held:
+                        _close_parallel_pool()
+        else:
+            with _model_lock:
+                try:
+                    _load_serial_model()
+                except Exception as ex:
+                    raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
+                try:
+                    result = _estimator.estimate(rgb)
+                finally:
+                    _last_used = time.monotonic()
+                    _held = hold
+                    if _release_after == 0 and not hold:
+                        _estimator.unload()
     if not result.humans:
         raise HTTPException(422, tr("未检测到人物"))
     return rgb, result
@@ -396,11 +495,15 @@ def session_views(sid: str, req: ViewsRequest) -> dict:
     s = _session(sid)
     aux = [_session(a).humans[0] for a in req.aux]
     if not aux:
-        s.fused, s.views = None, None
-        return {"views": []}
-    s.views = multiview.describe(s.humans[0], aux)
-    s.fused = multiview.fuse(s.humans[0], aux)
-    return {"views": s.views}
+        fused, views = None, None
+    else:
+        views = multiview.describe(s.humans[0], aux)
+        fused = multiview.fuse(s.humans[0], aux)
+    try:
+        _sessions.set_views(sid, fused, views)
+    except KeyError:
+        raise HTTPException(404, tr("会话不存在（后端重启过？请重新识别）"))
+    return {"views": views or []}
 
 
 @app.post("/sessions/{sid}/retarget")
@@ -472,7 +575,13 @@ def shutdown() -> dict:
     """插件"停止后端"用（后端可能不是插件启动的，拿不到进程句柄）。"""
     import os
 
-    threading.Timer(0.3, lambda: os._exit(0)).start()
+    def stop():
+        try:
+            _unload_model()  # waits for active recognition before releasing shared weights
+            _sessions.close()
+        finally:
+            os._exit(0)
+    threading.Timer(0.3, stop).start()
     return {"ok": True}
 
 

@@ -40,6 +40,9 @@ public class Configuration : IPluginConfiguration
     /// <summary>GPU 模式下把 MHR 留在 CPU，显存约省 750MB，每张约慢 0.5 秒。</summary>
     public bool MhrOnCpu { get; set; } = true;
 
+    /// <summary>多图预识别最多同时处理的图片数（1～8），默认串行；从下一批图片生效。</summary>
+    public int BatchRecognitionParallelism { get; set; } = 1;
+
     /// <summary>插件卸载 / 游戏退出时关闭由插件启动的后端。</summary>
     public bool StopBackendOnExit { get; set; } = true;
 
