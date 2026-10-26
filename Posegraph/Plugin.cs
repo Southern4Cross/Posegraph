@@ -73,6 +73,12 @@ public sealed class Plugin : IDalamudPlugin
         _main.ShowChangelog = () => _update.IsOpen = true;
         _main.ToggleLibrary = _library.Toggle;
         _main.Closed = () => _library.IsOpen = _split.IsOpen = false;
+        // 消息里可能有花括号（后端返回的 JSON），按参数传，不当成日志模板
+        _main.Recognition.Log = (message, ex) =>
+        {
+            if (ex is null) log.Warning("{Message}", message);
+            else log.Warning(ex, "{Message}", message);
+        };
         _main.LibraryChanged = _library.Refresh;
         _dragDrop = dragDrop;
         _framework = framework;

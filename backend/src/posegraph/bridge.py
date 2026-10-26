@@ -9,7 +9,8 @@ from .config import settings
 
 class BridgeClient:
     def __init__(self, base_url: str | None = None, timeout: float = 10.0):
-        self._http = httpx.Client(base_url=base_url or settings.bridge_url, timeout=timeout)
+        # 插件在本机：不读环境变量 / 系统代理（代理软件会改写或拦截本机请求）
+        self._http = httpx.Client(base_url=base_url or settings.bridge_url, timeout=timeout, trust_env=False)
 
     def status(self) -> dict:
         return self._http.get("/status").raise_for_status().json()

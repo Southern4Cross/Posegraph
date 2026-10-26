@@ -117,6 +117,8 @@ static async Task UndecodableImageRetriesAsPng()
         f.Backend.OnlyPng = true;
         var (info, _) = await f.Service.OpenAsync(f.Images(1)[0]);
         Check(info.SessionId.Length > 0 && f.Backend.Created == 2, "undecodable image was not retried once as PNG");
+        Check(f.Logs.Any(l => l.Message.Contains("无法解码图片") && l.Message.Contains("文件头 00010203")) &&
+              f.Logs.Any(l => l.Message.Contains("已用 Windows 解码转成 PNG")), "decode failure / retry was not logged");
     }
     using (var f = new Fixture(1, _ => throw new InvalidOperationException("Windows cannot decode it either")))
     {
@@ -124,14 +126,24 @@ static async Task UndecodableImageRetriesAsPng()
         var error = await Record(() => f.Service.OpenAsync(f.Images(1)[0]));
         Check(error is BackendException { StatusCode: 400 } && error.Message.Contains("无法解码图片") && f.Backend.Created == 1,
             "a failed conversion must surface the backend's original decode error");
+        Check(f.Logs.Any(l => l.Error?.Message == "Windows cannot decode it either"), "the Windows decode failure was not logged");
     }
     using (var f = new Fixture(1, image => Task.FromResult(Png(image))))
     {
         f.Backend.Fail500 = true;
         var error = await Record(() => f.Service.OpenAsync(f.Images(1)[0]));
         Check(error is BackendException { StatusCode: 503 } && f.Backend.Created == 1, "only decode errors (400) may be retried");
+        Check(f.Logs.Count == 1 && f.Logs[0].Error is BackendException { StatusCode: 503 }, "other failures must be logged once");
     }
-    Console.WriteLine("PASS undecodable images retry once as PNG decoded by Windows");
+    var formats = new (byte[] Data, string Expected)[]
+    {
+        ([0x00, 0x00, 0x00, 0x18, .. "ftypheic"u8], "HEIC"), ([0x00, 0x00, 0x00, 0x1C, .. "ftypavif"u8], "AVIF"),
+        ([0x49, 0x49, 0xBC, 0x01], "JPEG XR"), ([0xFF, 0x0A, 0xFA], "JPEG XL"), ("<!DOCTYPE html>"u8.ToArray(), "HTML"),
+        ([0xFF, 0xD8, 0xFF, 0xE0], "JPEG"), ([], "空文件"),
+    };
+    foreach (var (data, expected) in formats)
+        Check(ImageFormat.Describe(data).StartsWith(expected), $"format sniffing: expected {expected}, got {ImageFormat.Describe(data)}");
+    Console.WriteLine("PASS undecodable images retry once as PNG decoded by Windows, with details logged");
 }
 
 static async Task<Exception?> Record(Func<Task> action)
@@ -147,6 +159,7 @@ sealed class Fixture : IDisposable
     public readonly BackendClient Client;
     public readonly ImageLibrary Library;
     public readonly RecognitionService Service;
+    public readonly List<(string Message, Exception? Error)> Logs = [];
 
     public Fixture(int parallelism, Func<byte[], Task<byte[]>>? toPng = null)
     {
@@ -154,6 +167,7 @@ sealed class Fixture : IDisposable
         Library = new ImageLibrary(Directory, Directory);
         Client = new BackendClient(() => Backend.Port);
         Service = new RecognitionService(Library, Client, () => true) { Parallelism = () => parallelism, ToPng = toPng };
+        Service.Log = (message, error) => { lock (Logs) Logs.Add((message, error)); };
     }
 
     public string Image(string name, int marker)

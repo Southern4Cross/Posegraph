@@ -12,8 +12,9 @@ public sealed partial class BackendClient(Func<int> port) : IDisposable
     // 识别首次要加载模型，可能超过半分钟
     private readonly HttpClient _http = new(new LanguageHandler()) { Timeout = TimeSpan.FromSeconds(180) };
 
-    /// <summary>每个请求带上界面语言，后端返回的提示 / 错误信息按它翻译。</summary>
-    private sealed class LanguageHandler() : DelegatingHandler(new HttpClientHandler())
+    /// <summary>每个请求带上界面语言，后端返回的提示 / 错误信息按它翻译。
+    /// 后端只在本机：不走系统代理（加速器 / 代理软件会改写请求体，后端收到的图片无法解码、连接被重置）。</summary>
+    private sealed class LanguageHandler() : DelegatingHandler(new HttpClientHandler { UseProxy = false })
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {

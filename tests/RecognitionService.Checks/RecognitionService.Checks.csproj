@@ -3,6 +3,7 @@
   <ItemGroup>
     <Compile Include="../../Posegraph/Library/RecognitionService.cs" Link="RecognitionService.cs" />
     <Compile Include="../../Posegraph/Library/ImageLibrary.cs" Link="ImageLibrary.cs" />
+    <Compile Include="../../Posegraph/Library/ImageFormat.cs" Link="ImageFormat.cs" />
     <Compile Include="../../Posegraph/Library/RecognitionService.Parallel.cs" Link="RecognitionService.Parallel.cs" />
     <Compile Include="../../Posegraph/Backend/BackendClient.cs" Link="BackendClient.cs" />
     <Compile Include="../../Posegraph/Backend/BackendClient.Parallel.cs" Link="BackendClient.Parallel.cs" />

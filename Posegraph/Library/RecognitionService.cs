@@ -53,6 +53,9 @@ public sealed partial class RecognitionService(ImageLibrary library, BackendClie
     /// <summary>图片字节 → PNG（经 Windows 解码）；后端解码不了时用来转码重试，见 CreateAsync。</summary>
     public Func<byte[], Task<byte[]>>? ToPng { get; init; }
 
+    /// <summary>识别失败的详细信息写进 Dalamud 日志（/xllog）：文件真实格式、后端报错、转码重试的经过（由 Plugin 接上）。</summary>
+    public Action<string, Exception?>? Log { get; set; }
+
     private async Task<SessionInfo> CreateAsync(byte[] bytes, string name, bool parallel = false)
     {
         var hold = Volatile.Read(ref _batches) > 0;
@@ -61,15 +64,36 @@ public sealed partial class RecognitionService(ImageLibrary library, BackendClie
         {
             return await client.CreateSessionAsync(bytes, name, hold, parallel);
         }
-        catch (BackendException ex) when (ex.StatusCode == 400 && ToPng is not null)
+        catch (BackendException ex) when (ex.StatusCode == 400)
         {
             // 后端解码不了（HEIC、JPEG XL 等改了扩展名的图）：Windows 能解码的话转成 PNG 再试一次，解不了就报原来的错
+            Log?.Invoke($"[识别] {name}：{ex.Message}；实际内容：{ImageFormat.Describe(bytes)}", null);
+            if (ToPng is null) throw;
             byte[]? png = null;
             try { png = await ToPng(bytes); }
-            catch { }
+            catch (Exception decode) { Log?.Invoke($"[识别] {name}：Windows 也无法解码，不再重试", decode); }
             if (png is null) throw;
-            return await client.CreateSessionAsync(png, name, hold, parallel);
+            Log?.Invoke($"[识别] {name}：已用 Windows 解码转成 PNG（{png.Length} 字节），重试", null);
+            try
+            {
+                return await client.CreateSessionAsync(png, name, hold, parallel);
+            }
+            catch (Exception retry)
+            {
+                Log?.Invoke($"[识别] {name}：转成 PNG 后仍然失败", retry);
+                throw;
+            }
         }
+        catch (Exception ex) when (ex is not OperationCanceledException && LogFailure(name, bytes, ex))
+        {
+            throw;   // LogFailure 总是返回 false，这里不会进来：只是在不改变异常的前提下记一笔
+        }
+    }
+
+    private bool LogFailure(string name, byte[] bytes, Exception ex)
+    {
+        Log?.Invoke($"[识别] {name} 失败；图片：{ImageFormat.Describe(bytes)}", ex);
+        return false;
     }
 
     public int Pending => _queue.Count;
