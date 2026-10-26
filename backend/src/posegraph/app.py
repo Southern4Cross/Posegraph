@@ -10,6 +10,7 @@
   GET  /sessions/{id}/image            预览图（PNG，长边不超过 1280）
   POST /sessions/{id}/retarget         按参数重定向（只算重定向，几十毫秒），返回 Brio 姿势、叠加层、火柴人、合理性提示
   POST /sessions/{id}/camera           按照片镜头设置 GPose 相机（经 Posegraph HTTP 闭环求解）
+  POST /sessions/{id}/views            挂上辅助视角（别的会话里识别好的同一姿势），重定向默认用融合结果（multiview.py）
   GET  /presets                        参数预设
   GET  /races                          支持的种族骨架（retarget/races.py）
   POST /shutdown                       退出服务
@@ -49,6 +50,10 @@ _model_lock = threading.RLock()
 _model_state = {"loading": False, "error": None}
 _release_after = settings.release_after
 _last_used = time.monotonic()
+# 插件批量识别（主图 + 辅助视角、拆分模式全部应用、批量队列）时请求带 hold：这张识别完先不释放，
+# 整批结束插件再调 /model/unload。插件中途退出没调时，按 HOLD_TIMEOUT 秒空闲兜底释放
+_held = False
+HOLD_TIMEOUT = 60
 
 PREVIEW_MAX_SIDE = 1280
 MAX_SESSIONS = 8
@@ -63,6 +68,8 @@ class Session:
     preview_png: bytes
     humans: list[dict]          # 键同 image_to_pose 的 npz
     inference_ms: float
+    fused: dict | None = None   # 挂了辅助视角时第 0 人的融合结果
+    views: list | None = None   # 各辅助视角的说明（multiview.describe）
 
 
 _sessions: OrderedDict[str, Session] = OrderedDict()
@@ -90,20 +97,25 @@ def _load_model() -> None:
 
 
 def _unload_model() -> None:
+    global _held
     with _model_lock:
         _estimator.unload()
+        _held = False
 
 
 def _release_loop() -> None:
     """按策略释放模型：识别后空闲超过 release_after 秒就卸载（0 在识别结束时立即卸载，见 _estimate）。"""
+    global _held
     while True:
         time.sleep(2)
-        idle = lambda: (_release_after > 0 and _estimator.loaded and not _model_state["loading"]
-                        and time.monotonic() - _last_used > _release_after)
+        limit = lambda: HOLD_TIMEOUT if _release_after == 0 and _held else _release_after
+        idle = lambda: (limit() > 0 and _estimator.loaded and not _model_state["loading"]
+                        and time.monotonic() - _last_used > limit())
         if idle():
             with _model_lock:   # 拿到锁时可能刚识别完，再判断一次
                 if idle():
                     _estimator.unload()
+                    _held = False
 
 
 def _model_info() -> dict:
@@ -212,12 +224,13 @@ def _session(sid: str) -> Session:
 
 
 @app.post("/sessions")
-async def create_session(request: Request, name: str = "image") -> dict:
+async def create_session(request: Request, name: str = "image", hold: bool = False) -> dict:
+    """hold：后面还有同一批的图要识别，这张识别完先不按「立即释放」卸载模型。"""
     data = await request.body()
     if not data:
         raise HTTPException(400, tr("请求体为空"))
     # 识别约几秒，放到线程池里跑，期间 /health 仍能响应
-    rgb, result = await run_in_threadpool(_estimate, data)
+    rgb, result = await run_in_threadpool(_estimate, data, hold)
     humans = []
     for h in result.humans:
         humans.append({"joint_global_rots": h.joint_global_rots, "joint_coords": h.joint_coords,
@@ -276,8 +289,8 @@ def session_delete(sid: str) -> dict:
     return {"ok": True}
 
 
-def _estimate(data: bytes):
-    global _last_used
+def _estimate(data: bytes, hold: bool = False):
+    global _last_used, _held
     rgb = _decode(data)
     with _model_lock:
         try:
@@ -288,7 +301,8 @@ def _estimate(data: bytes):
             result = _estimator.estimate(rgb)
         finally:
             _last_used = time.monotonic()
-            if _release_after == 0:
+            _held = hold
+            if _release_after == 0 and not hold:
                 _estimator.unload()
     if not result.humans:
         raise HTTPException(422, tr("未检测到人物"))
@@ -308,6 +322,7 @@ class RetargetRequest(BaseModel):
     stick: bool = True
     race: str | None = None         # 骨架编号 cXXXX（插件按角色外貌数据识别）；缺省时按 reference 的骨长推断
     trust_reference: bool = False   # 插件已清除过 Brio 姿势栈：骨长不符也按游戏实际值（Customize+、改体型 MOD）
+    use_aux: bool = True            # 挂了辅助视角时用融合结果
 
 
 def _ivcs(ref: BrioPose | None, race: dict) -> bool | None:
@@ -361,16 +376,37 @@ def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
     return {**info, "source": source, "warnings": warnings}
 
 
-def _human(s: Session, person: int) -> dict:
+def _human(s: Session, person: int, use_aux: bool = True) -> dict:
     if not 0 <= person < len(s.humans):
         raise HTTPException(400, tr("人物序号超出范围（共 {count} 人）", count=len(s.humans)))
+    if use_aux and person == 0 and s.fused is not None:
+        return s.fused
     return s.humans[person]
+
+
+class ViewsRequest(BaseModel):
+    aux: list[str] = []    # 辅助图的会话（各取第 0 人）；空列表为去掉辅助视角
+
+
+@app.post("/sessions/{sid}/views")
+def session_views(sid: str, req: ViewsRequest) -> dict:
+    """融合在这里算一次存进会话（几十毫秒），之后的重定向直接用；辅助图的会话用完插件可以删掉。"""
+    from . import multiview
+
+    s = _session(sid)
+    aux = [_session(a).humans[0] for a in req.aux]
+    if not aux:
+        s.fused, s.views = None, None
+        return {"views": []}
+    s.views = multiview.describe(s.humans[0], aux)
+    s.fused = multiview.fuse(s.humans[0], aux)
+    return {"views": s.views}
 
 
 @app.post("/sessions/{sid}/retarget")
 def session_retarget(sid: str, req: RetargetRequest) -> dict:
     s = _session(sid)
-    human = _human(s, req.person)
+    human = _human(s, req.person, req.use_aux)
     t0 = time.perf_counter()
     ref = BrioPose.loads(req.reference) if req.reference else None
     race = _resolve_race(req.race, ref)
@@ -394,6 +430,7 @@ class CameraRequest(BaseModel):
     params: tuning.RetargetParams = tuning.RetargetParams()
     actor: int | None = None
     race: str | None = None
+    use_aux: bool = True
 
 
 @app.post("/sessions/{sid}/camera")
@@ -403,7 +440,7 @@ def session_camera(sid: str, req: CameraRequest) -> dict:
     from .camera import framing_error, photo_camera_in_world, solve_gpose_camera
 
     s = _session(sid)
-    human = _human(s, req.person)
+    human = _human(s, req.person, req.use_aux)
     client = BridgeClient()
     pose_json = client.get_pose(req.actor)
     ref = BrioPose.loads(pose_json)

@@ -9,13 +9,53 @@ public sealed record RecognitionStatus(RecognitionState State, string? Error = n
 
 /// <summary>
 /// 识别与识别缓存：同一张图（按内容）识别过就从缓存恢复会话，不再跑模型；批量识别按队列逐张进行（后端一次只跑一个模型）。
+/// releaseImmediately：模型释放策略是「识别后立即释放」（批量结束时由这里卸载，见 Batch）。
 /// </summary>
-public sealed class RecognitionService(ImageLibrary library, BackendClient client) : IDisposable
+public sealed class RecognitionService(ImageLibrary library, BackendClient client, Func<bool> releaseImmediately) : IDisposable
 {
     private readonly ConcurrentQueue<string> _queue = new();
     private readonly ConcurrentDictionary<string, RecognitionStatus> _status = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _cts = new();
     private int _worker;
+    private int _batches;   // 进行中的批次数：大于 0 时识别请求带 hold，模型不在每张之后卸载
+    private int _held;      // 本轮批次里真的跑过模型（结束时才需要卸载）
+
+    /// <summary>
+    /// 批量识别范围（主图 + 辅助视角、拆分模式全部应用、批量队列）：范围内模型只加载一次。
+    /// 释放策略为「立即释放」时，所有批次都结束后卸载一次；其他策略照常按空闲时间释放。可以嵌套、并行。
+    /// </summary>
+    public IAsyncDisposable Batch()
+    {
+        Interlocked.Increment(ref _batches);
+        return new BatchScope(this);
+    }
+
+    private sealed class BatchScope(RecognitionService owner) : IAsyncDisposable
+    {
+        private int _done;
+
+        public ValueTask DisposeAsync() => Interlocked.Exchange(ref _done, 1) == 1 ? ValueTask.CompletedTask : owner.EndBatchAsync();
+    }
+
+    private async ValueTask EndBatchAsync()
+    {
+        if (Interlocked.Decrement(ref _batches) > 0 || Interlocked.Exchange(ref _held, 0) == 0 || !releaseImmediately()) return;
+        try
+        {
+            await client.UnloadModelAsync();
+        }
+        catch
+        {
+            // 后端没响应时它自己会在空闲一分钟后释放
+        }
+    }
+
+    private Task<SessionInfo> CreateAsync(byte[] bytes, string name)
+    {
+        var hold = Volatile.Read(ref _batches) > 0;
+        if (hold) Interlocked.Exchange(ref _held, 1);
+        return client.CreateSessionAsync(bytes, name, hold);
+    }
 
     public int Pending => _queue.Count;
     public bool Busy => Volatile.Read(ref _worker) != 0;
@@ -42,7 +82,7 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
                 library.DeleteCache(sha1);   // 缓存坏了或格式过时：重新识别
             }
         }
-        var info = await client.CreateSessionAsync(bytes, name);
+        var info = await CreateAsync(bytes, name);
         try
         {
             library.WriteCache(sha1, await client.SessionArchiveAsync(info.SessionId));
@@ -54,6 +94,36 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
         _status[path] = new RecognitionStatus(RecognitionState.Done);
         library.Save();
         return (info, sha1);
+    }
+
+    private readonly ConcurrentDictionary<string, AuxView> _views = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>辅助视角图上次融合时识别出的视角（菜单里显示）；还没融合过返回 null。</summary>
+    public AuxView? ViewOf(string auxPath) => _views.GetValueOrDefault(auxPath);
+
+    /// <summary>
+    /// 把主图挂着的辅助视角图（没识别过的先识别，结果同样进识别缓存）融合进主图的会话，之后的重定向默认用融合结果。
+    /// 没有辅助图时清掉会话里的融合结果。辅助图的会话用完就删。返回 (辅助图路径, 视角) 列表。
+    /// </summary>
+    public async Task<(string Path, AuxView View)[]> AttachAuxAsync(string sid, string sha1)
+    {
+        await using var batch = Batch();
+        var aux = library.AuxImages(sha1);
+        var sessions = new List<string>();
+        try
+        {
+            foreach (var path in aux)
+                sessions.Add((await OpenAsync(path)).Info.SessionId);
+            var views = await client.SetViewsAsync(sid, sessions);
+            var result = aux.Zip(views).ToArray();
+            foreach (var (path, view) in result) _views[path] = view;
+            return result;
+        }
+        finally
+        {
+            foreach (var s in sessions)
+                _ = client.DeleteSessionAsync(s).ContinueWith(_ => { });
+        }
     }
 
     /// <summary>会话丢了（后端重启、被挤出）时用缓存恢复；没有缓存返回 null。</summary>
@@ -84,6 +154,7 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
     {
         try
         {
+            await using var batch = Batch();   // 整个队列只加载一次模型
             while (!_cts.IsCancellationRequested && _queue.TryDequeue(out var path))
             {
                 if (!_status.ContainsKey(path)) continue;   // 已取消
@@ -93,10 +164,14 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
                 {
                     var bytes = await File.ReadAllBytesAsync(path, _cts.Token);
                     var sha1 = library.RememberHash(path, bytes);
-                    if (!library.HasCache(sha1))
+                    // 挂着的辅助视角图一起识别，打开时不用再等
+                    foreach (var file in library.AuxImages(sha1).Prepend(path))
                     {
-                        var info = await client.CreateSessionAsync(bytes, Path.GetFileNameWithoutExtension(path));
-                        library.WriteCache(sha1, await client.SessionArchiveAsync(info.SessionId));
+                        var data = file == path ? bytes : await File.ReadAllBytesAsync(file, _cts.Token);
+                        var hash = file == path ? sha1 : library.RememberHash(file, data);
+                        if (library.HasCache(hash)) continue;
+                        var info = await CreateAsync(data, Path.GetFileNameWithoutExtension(file));
+                        library.WriteCache(hash, await client.SessionArchiveAsync(info.SessionId));
                         await client.DeleteSessionAsync(info.SessionId);   // 批量识别的会话不留在后端，免得挤掉当前图
                     }
                     _status[path] = new RecognitionStatus(RecognitionState.Done);
