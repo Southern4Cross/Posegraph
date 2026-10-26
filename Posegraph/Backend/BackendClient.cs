@@ -5,7 +5,7 @@ using System.Text.Json;
 namespace Posegraph.Backend;
 
 /// <summary>识别后端（backend）的 HTTP 客户端。接口见 backend/src/posegraph/app.py。</summary>
-public sealed class BackendClient(Func<int> port) : IDisposable
+public sealed partial class BackendClient(Func<int> port) : IDisposable
 {
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -42,54 +42,39 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     public Task ConfigureAsync(Configuration c) => PostAsync("/model/config",
         new Dictionary<string, object> { ["device"] = c.BackendDevice, ["release_after"] = c.ReleaseAfter, ["mhr_on_cpu"] = c.MhrOnCpu });
 
-    /// <summary>每批预识别开始前同步并行上限，设备和释放策略保持不变。</summary>
-    public async Task ConfigureRecognitionAsync(int parallelism)
-    {
-        var limit = Math.Clamp(parallelism, 1, 8);
-        using var resp = await _http.PostAsJsonAsync(Url("/model/config"), new { recognition_parallelism = limit }, Json);
-        var body = await ReadAsync<JsonElement>(resp);
-        var confirmed = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("model", out var model) &&
-            model.ValueKind == JsonValueKind.Object && model.TryGetProperty("config", out var config) &&
-            config.ValueKind == JsonValueKind.Object && config.TryGetProperty("recognitionParallelism", out var value) &&
-            value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var actual) && actual == limit;
-        // Older backends serialize inference and ignore this unknown config field.
-        // Accept that only for the default; never present HTTP fan-out as real parallel inference.
-        if (limit > 1 && !confirmed)
-            throw new InvalidOperationException(Loc.T("当前后端不支持并行识别，请更新并重启后端"));
-    }
-
-    /// <summary>hold：批次内先保留模型，所有批次结束后再按释放策略卸载。</summary>
-    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, bool hold = false, CancellationToken ct = default)
+    /// <summary>hold：同一批后面还有图要识别，这张识别完后端先不按「立即释放」卸载模型（整批结束再 UnloadModelAsync）。
+    /// parallel：批量队列的请求，后端可以共享模型并行识别（实验，见 BackendClient.Parallel.cs）。</summary>
+    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, bool hold = false, bool parallel = false)
     {
         using var content = new ByteArrayContent(image);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}{(hold ? "&hold=true" : "")}"), content, ct);
-        return (await ReadAsync<SessionInfo>(resp, ct))!;
+        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}{(hold ? "&hold=true" : "")}{(parallel ? "&parallel=true" : "")}"), content);
+        return (await ReadAsync<SessionInfo>(resp))!;
     }
 
-    public Task<byte[]> SessionImageAsync(string sid, CancellationToken ct = default) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"), ct);
+    public Task<byte[]> SessionImageAsync(string sid) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"));
 
     /// <summary>会话存档（npz），存进图库的识别缓存。</summary>
-    public async Task<byte[]> SessionArchiveAsync(string sid, CancellationToken ct = default)
+    public async Task<byte[]> SessionArchiveAsync(string sid)
     {
-        using var resp = await _http.GetAsync(Url($"/sessions/{sid}/archive"), ct);
-        await EnsureSuccessAsync(resp, ct);
-        return await resp.Content.ReadAsByteArrayAsync(ct);
+        using var resp = await _http.GetAsync(Url($"/sessions/{sid}/archive"));
+        await EnsureSuccessAsync(resp);
+        return await resp.Content.ReadAsByteArrayAsync();
     }
 
     /// <summary>从识别缓存恢复会话（不加载模型）。</summary>
-    public async Task<SessionInfo> RestoreSessionAsync(byte[] archive, string name, CancellationToken ct = default)
+    public async Task<SessionInfo> RestoreSessionAsync(byte[] archive, string name)
     {
         using var content = new ByteArrayContent(archive);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions/archive?name={Uri.EscapeDataString(name)}"), content, ct);
-        return (await ReadAsync<SessionInfo>(resp, ct))!;
+        using var resp = await _http.PostAsync(Url($"/sessions/archive?name={Uri.EscapeDataString(name)}"), content);
+        return (await ReadAsync<SessionInfo>(resp))!;
     }
 
-    public async Task DeleteSessionAsync(string sid, CancellationToken ct = default)
+    public async Task DeleteSessionAsync(string sid)
     {
-        using var resp = await _http.DeleteAsync(Url($"/sessions/{sid}"), ct);
-        await EnsureSuccessAsync(resp, ct);
+        using var resp = await _http.DeleteAsync(Url($"/sessions/{sid}"));
+        await EnsureSuccessAsync(resp);
     }
 
     public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race,
@@ -120,16 +105,16 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     }
 
     /// <summary>非 2xx 时把后端 FastAPI 的 detail 作为异常信息抛出。</summary>
-    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp, CancellationToken ct = default)
+    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp)
     {
-        await EnsureSuccessAsync(resp, ct);
-        return await resp.Content.ReadFromJsonAsync<T>(Json, ct);
+        await EnsureSuccessAsync(resp);
+        return await resp.Content.ReadFromJsonAsync<T>(Json);
     }
 
-    private static async Task EnsureSuccessAsync(HttpResponseMessage resp, CancellationToken ct = default)
+    private static async Task EnsureSuccessAsync(HttpResponseMessage resp)
     {
         if (resp.IsSuccessStatusCode) return;
-        var text = await resp.Content.ReadAsStringAsync(ct);
+        var text = await resp.Content.ReadAsStringAsync();
         string detail = text;
         try { detail = JsonDocument.Parse(text).RootElement.GetProperty("detail").ToString(); } catch { }
         throw new BackendException((int)resp.StatusCode, Loc.F("后端返回 {0}：{1}", (int)resp.StatusCode, detail));

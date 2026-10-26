@@ -117,11 +117,10 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
 - *Save to the Brio pose library* writes `.pose` files with a preview image and tags to `Documents\Brio\Poses\Posegraph`,
   where they show up in Brio's library.
 
-Library batches are sequential by default. Choose **1–8** under *Settings → Recognition backend → Multi-image recognition concurrency*; changes apply to the next batch.
-**1 uses the original serial path; 2–8 recognize concurrently with one shared copy of the model weights.** Set it back to 1 to fall back; no strategy selection is required.
-More jobs still increase RAM, VRAM and individual request latency. Do not multiply a full-model budget by the concurrency setting. See [parallel recognition notes and measurements](docs/parallel-recognition.md).
-Completed library items can be opened while other jobs continue. In-game library interaction, Brio, and GPU contention with the game remain untested.
-Stopping a batch skips queued items and lets running jobs save their archives and release temporary sessions. Content-hash caches and restoration after a backend restart are preserved; more than eight intermediate sessions spill to temporary disk until archived and deleted.
+Library batches are recognized one image at a time by default. With *Settings → Recognition backend → Batch recognition concurrency (experimental)*
+set to 2–8, several images in a batch share one model and run together (about 35% less time per batch on an RTX 4060 laptop, ~300 MB more VRAM);
+single images and auxiliary views are always one at a time. The backend lowers the count to fit free VRAM / RAM, and falls back to one at a time
+(with a single notice) if the shared model is unavailable. See [parallel recognition notes](docs/parallel-recognition.md).
 
 Status bar icons, left to right: Brio, GPose, IVCS (shown once an actor is selected in GPose), backend, VRAM, RAM;
 hover for details.
@@ -132,7 +131,7 @@ hover for details.
 |---|---|---|
 | Language | Auto | Chinese if the game client is Chinese, otherwise the Dalamud UI language decides; English if neither is Chinese |
 | Device | Auto | GPU when ~3 GB VRAM is free, otherwise CPU. *GPU* forces the GPU, *CPU* never touches VRAM |
-| Multi-image recognition concurrency | 1 | 1 uses the original serial path; 2–8 share model weights. Effective next batch; set 1 to fall back |
+| Batch recognition concurrency (experimental) | 1 | Batch recognition only; 2–8 share one model and run together. Effective next batch; 1 = one at a time |
 | Unload model | Right after recognition | Frees VRAM/RAM for the game; the next recognition reloads the model (~5–10 s) |
 | Keep MHR on the CPU | On | Saves ~750 MB VRAM in GPU mode, ~0.5 s slower |
 | Apply when a slider is released | On | Turn off to apply manually |
@@ -185,11 +184,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_sam3d.ps1     # venv, CUD
 Weights come from ModelScope by default (no login); `-Source hf` uses the official gated Hugging Face repository.
 Environment variables (prefix `POSEGRAPH_`): `DEVICE` (auto|cuda|cpu), `PRECISION` (auto|bf16|fp16|fp32), `MHR_ON_CPU`,
 `MIN_FREE_VRAM_MB`, `RELEASE_AFTER` (seconds, 0 = right away, -1 = keep), `PRELOAD`, `SAVE_SESSIONS` (save each recognition as an npz under `outputs/ui`), `PORT`, `BRIDGE_URL`, `SAM3D_REPO`, `SAM3D_CKPT`.
-`RECOGNITION_PARALLELISM` sets startup concurrency (1–8, default 1). It can also be changed at runtime; set 1 to fall back to the original serial path:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_parallelism":3}'
-```
+`RECOGNITION_PARALLELISM`: batch recognition concurrency (1–8, default 1; the plugin sets it before each batch). `DISABLE_PARALLEL=1` turns parallel recognition off entirely.
 
 ### Backend package
 

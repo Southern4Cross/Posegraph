@@ -294,9 +294,16 @@ public sealed class ImageLibrary
     public void WriteCache(string sha1, byte[] archive)
     {
         Directory.CreateDirectory(CacheDir);
-        var tmp = CachePath(sha1) + ".tmp";
+        var tmp = $"{CachePath(sha1)}.{Guid.NewGuid():N}.tmp";   // 同一张图可能同时在识别（批量并行、打开图片），各写各的临时文件
         File.WriteAllBytes(tmp, archive);
-        File.Move(tmp, CachePath(sha1), true);
+        try
+        {
+            File.Move(tmp, CachePath(sha1), true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && File.Exists(CachePath(sha1)))
+        {
+            File.Delete(tmp);   // 另一路刚写好（或正在读）同一张图的缓存，内容相同
+        }
         if (HasCache(sha1)) return;
         lock (_lock) _cached!.Add(sha1);
     }

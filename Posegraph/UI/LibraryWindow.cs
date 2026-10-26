@@ -656,6 +656,7 @@ public sealed class LibraryWindow : Window, IDisposable
 
     private void DrawFooter()
     {
+        if (_recognition.TakeNotice() is { } notice) SetStatus(notice, Yellow);   // 批量并行识别（实验）的提示
         var text = _selection.Count > 0 ? Loc.F("已选 {0} 项", _selection.Count) : Loc.F("{0} 项", Entries().Length);
         if (_recognition.Pending > 0 || _recognition.Busy)
             text += Loc.F("　批量识别：剩 {0} 张", _recognition.Pending + (_recognition.Busy ? 1 : 0));

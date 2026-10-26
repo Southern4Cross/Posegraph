@@ -31,8 +31,10 @@ class Settings:
     min_free_vram_mb: int = field(default_factory=lambda: int(_env("MIN_FREE_VRAM_MB", "3000")))
     # 识别完成后多少秒释放模型：0 立即释放，-1 常驻
     release_after: float = field(default_factory=lambda: float(_env("RELEASE_AFTER", "0")))
-    # 多图识别并行数；1 走原串行链路，2–8 共享一份模型权重并行。
+    # 批量识别并行数（实验，见 parallel_batch.py）：1 不并行；2–8 时只有插件标了 parallel 的批量请求共享一份模型并行
     recognition_parallelism: int = field(default_factory=lambda: min(8, max(1, int(_env("RECOGNITION_PARALLELISM", "1")))))
+    # 总开关：设为 1 时完全不用共享模型并行（出问题时临时关闭，所有识别走原串行）
+    disable_parallel: bool = field(default_factory=lambda: _env("DISABLE_PARALLEL", "0") == "1")
 
     # Posegraph 插件的本地 HTTP 地址
     bridge_url: str = field(default_factory=lambda: _env("BRIDGE_URL", "http://127.0.0.1:42429"))

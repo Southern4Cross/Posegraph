@@ -155,7 +155,7 @@ class BatchSessionApiTests(unittest.TestCase):
     def test_more_than_eight_images_remain_selectable_without_reinference(self):
         calls = []
 
-        def estimate(data, hold=False):
+        def estimate(data, hold=False, parallel=False):
             calls.append(data)
             marker = len(calls)
             human = HumanEstimate(
@@ -216,7 +216,7 @@ class BatchSessionApiTests(unittest.TestCase):
             self.assertEqual(self.client.get(f"/sessions/{restored_id}/image").content,
                              self.client.get(f"/sessions/{sid}/image").content)
             self.assertEqual(self.client.delete(f"/sessions/{restored_id}").json(), {"ok": True})
-        with patch.object(service, "_recognition_parallelism", 8), patch.object(service, "_parallel_pool", None), \
+        with patch.object(service, "_parallel", service.ParallelBatch(8, {})), \
                 patch.object(service, "_estimate", side_effect=AssertionError("archive restoration must not infer")):
             # 12 source sessions plus simultaneous restored sessions exceed the
             # eight RAM slots: none may vanish between create and GET archive.

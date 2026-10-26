@@ -141,7 +141,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _server = server;
         _client = new BackendClient(() => _config.BackendPort);
         Library = new ImageLibrary(pi.GetPluginConfigDirectory());
-        Recognition = new RecognitionService(Library, _client, () => _config.BatchRecognitionParallelism, () => _config.ReleaseAfter == 0);
+        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0) { Parallelism = () => _config.BatchRecognitionParallelism };
         Library.AuxChanged += OnAuxChanged;
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
@@ -174,10 +174,9 @@ public sealed partial class MainWindow : Window, IDisposable
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
-        Library.AuxChanged -= OnAuxChanged;
         Recognition.Dispose();
         Library.Save();
-        _ = Recognition.Completion.ContinueWith(t => { _ = t.Exception; _client.Dispose(); }, TaskScheduler.Default);
+        _client.Dispose();
         _updater.Dispose();
         _texture?.Dispose();
         _newTexture?.Dispose();

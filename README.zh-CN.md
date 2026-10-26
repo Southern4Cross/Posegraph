@@ -98,11 +98,9 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 - 选中多张批量识别，识别过的显示绿色对勾；识别结果缓存在 `文档\Posegraph\Cache`。
 - 「存到 Brio 姿势库」把带预览图和标签的 `.pose` 存到 `文档\Brio\Poses\Posegraph`，在 Brio 资料库里直接能看到。
 
-图库批量识别默认串行。在「设置 → 识别后端 → 多图识别并行数」可选 **1～8**，从下一批队列生效。
-**1 沿用原串行识别，2～8 使用共享一份模型权重的并行识别**；需要回退时设为 1，无需选择策略。
-更多任务仍会增加内存、显存和单次延迟；不要按并行数乘以整份模型预算。启用方式和 CPU/GPU 实测见[并行识别说明](docs/parallel-recognition.md)。
-已完成的图库项可立即打开，其余任务继续识别；游戏内图库交互、Brio 及与游戏争用 GPU 的体验尚未验证。
-停止批量识别只清除排队项；已开始的任务完成缓存并释放临时会话。缓存仍按内容哈希复用，支持后端重启后恢复；并发中间会话超过 8 份时暂存磁盘，归档后删除。
+图库批量识别默认逐张进行。「设置 → 识别后端 → 多图识别并行数（实验）」设为 2～8 时，批量队列几张图共享一份模型同时识别
+（RTX 4060 笔记本实测整批约省 35% 的时间，多占约 300MB 显存）；单张识别、辅助视角始终逐张。
+后端按剩余显存 / 内存自动减少路数，共享模型不可用时自动改回逐张识别并提示一次。详见[并行识别说明](docs/parallel-recognition.md)。
 
 状态栏图标从左到右：Brio、GPose、IVCS（GPose 里选中角色后显示）、后端、显存、内存，鼠标悬停看详情。
 
@@ -112,7 +110,7 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 |---|---|---|
 | 语言 | 自动 | 游戏客户端是中文就用中文，否则看 Dalamud 界面语言，都不是中文则用英文 |
 | 识别设备 | 自动 | 可用显存约 3GB 时用 GPU，否则用 CPU。「GPU」强制用显卡，「CPU」完全不占显存 |
-| 多图识别并行数 | 1 | 1 为原串行路径，2～8 共享权重并行；下批生效，设回 1 可回退 |
+| 多图识别并行数（实验） | 1 | 只影响批量识别；2～8 共享一份模型同时识别，下批生效，设回 1 即逐张 |
 | 模型释放 | 识别后立即释放 | 显存/内存归还给游戏，下次识别重新加载（约 5~10 秒） |
 | GPU 模式下 MHR 放 CPU | 开 | 显存约省 750MB，每张约慢 0.5 秒 |
 | 松开滑杆时自动应用 | 开 | 关掉后需要手动点应用 |
@@ -163,11 +161,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_sam3d.ps1     # 虚拟环
 权重默认从魔搭 ModelScope 下载（免登录）；`-Source hf` 走 Hugging Face 官方仓库（需申请访问）。
 环境变量（前缀 `POSEGRAPH_`）：`DEVICE`（auto|cuda|cpu）、`PRECISION`（auto|bf16|fp16|fp32）、`MHR_ON_CPU`、
 `MIN_FREE_VRAM_MB`、`RELEASE_AFTER`（秒，0 立即、-1 常驻）、`PRELOAD`、`SAVE_SESSIONS`（每次识别另存 npz 到 `outputs/ui`）、`PORT`、`BRIDGE_URL`、`SAM3D_REPO`、`SAM3D_CKPT`。
-`RECOGNITION_PARALLELISM` 为启动并行数（1～8，默认 1）；运行中也可设置并行数，设为 1 回退原串行路径：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_parallelism":3}'
-```
+`RECOGNITION_PARALLELISM`：批量识别并行数（1～8，默认 1，插件会在每批开始前设置）；`DISABLE_PARALLEL=1` 完全关掉并行，所有识别逐张进行。
 
 ### 后端一键包
 

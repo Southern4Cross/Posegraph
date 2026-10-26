@@ -91,8 +91,9 @@ class FakeEstimator:
 
 
 class FakePool:
-    def __init__(self, parallelism, config):
+    def __init__(self, parallelism, config, on_loaded=None):
         self.parallelism, self.config = parallelism, dict(config)
+        self.on_loaded = on_loaded
         self.loaded = self.closed = False
         self.estimates = 0
 

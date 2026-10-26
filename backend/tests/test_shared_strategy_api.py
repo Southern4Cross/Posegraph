@@ -1,4 +1,7 @@
-"""Serial/shared backend API contracts, without model weights or Torch."""
+"""串行 / 批量并行的后端接口约定（不需要权重和 Torch）。
+
+并行只处理带 parallel 标记的请求；共享模型出问题时交回串行，内存里不同时放两份模型。
+"""
 import sys
 import threading
 import unittest
@@ -12,8 +15,16 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from posegraph import app as service
-from posegraph.shared_inference import InferenceFailure, ModelLifecycle, SharedInferencePool
+from posegraph import parallel_batch
+from posegraph.parallel_batch import ParallelBatch
+from posegraph.shared_inference import InferenceFailure, ModelLifecycle
 from inference_fakes import FakeEstimator, FakePool
+
+IMAGE = np.zeros((2, 2, 3), dtype=np.uint8)
+
+
+class UnsupportedSharedRuntime(RuntimeError):
+    """与 estimators/shared_sam3d.py 里的同名异常一样按类名识别。"""
 
 
 class SharedStrategyApiTests(unittest.TestCase):
@@ -21,41 +32,130 @@ class SharedStrategyApiTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         for key, value in {
-            "_estimator": FakeEstimator(), "_parallel_pool": None,
-            "_model_lifecycle": ModelLifecycle(), "_recognition_parallelism": 1,
-            "_release_after": -1,
-            "_held": False, "_active_pool_requests": 0,
+            "_estimator": FakeEstimator(), "_parallel": ParallelBatch(1, {}),
+            "_model_lifecycle": ModelLifecycle(), "_release_after": -1, "_held": False,
             "_model_state": {"loading": False, "error": None},
         }.items():
             self.stack.enter_context(patch.object(service, key, value))
-        self.factory = self.stack.enter_context(patch.object(service, "SharedInferencePool", side_effect=FakePool))
+        self.factory = self.stack.enter_context(patch.object(parallel_batch, "SharedInferencePool", side_effect=FakePool))
+        self.stack.enter_context(patch.object(service, "_decode", side_effect=lambda data: data))
         self.addCleanup(service._unload_model)
 
-    def test_default_single_slot_uses_original_serial_path(self):
+    def configure(self, parallelism, **kwargs):
+        return service.model_config(service.ModelConfig(recognition_parallelism=parallelism, **kwargs))
+
+    def test_requests_without_flag_stay_serial(self):
+        self.configure(3)
         service._load_model()
+        result = service._estimate(IMAGE, False, False)[1]
+        self.assertEqual(result.humans, [1])
         self.assertTrue(service._estimator.loaded)
         self.factory.assert_not_called()
-        self.assertNotIn("recognitionStrategy", service._model_info()["config"])
 
-    def test_parallel_slots_use_shared_adapter_and_report_one_copy(self):
-        service.model_config(service.ModelConfig(recognition_parallelism=2))
+    def test_flag_is_ignored_when_parallelism_is_one(self):
+        service._estimate(IMAGE, True, True)
+        self.assertTrue(service._estimator.loaded)
+        self.factory.assert_not_called()
+
+    def test_flagged_requests_share_one_model_and_unload_serial(self):
         service._load_model()
-        pool = service._parallel_pool
+        self.configure(3)
+        service._estimate(IMAGE, True, True)
+        pool = service._parallel._pool
         self.assertIsInstance(pool, FakePool)
-        self.assertEqual(pool.parallelism, 2)
-        self.assertFalse(service._estimator.loaded)
-        self.assertNotIn("cuda_streams", pool.config)
-        self.assertEqual(service._model_info()["modelCopies"], 1)
-        with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
-            service._estimate(b"image")
+        self.assertEqual(pool.parallelism, 3)
         self.assertEqual(pool.estimates, 1)
+        self.assertFalse(service._estimator.loaded)
+        info = service._model_info()
+        self.assertTrue(info["loaded"])
+        self.assertTrue(info["parallel"]["loaded"])
+        self.assertEqual(info["config"]["recognitionParallelism"], 3)
 
-    def test_plugin_partial_updates_preserve_parallelism(self):
+    def test_runtime_failure_disables_parallel_and_falls_back_to_serial(self):
+        for error in (InferenceFailure(503, "fake load failure"), UnsupportedSharedRuntime("fingerprint mismatch")):
+            with self.subTest(error=type(error).__name__):
+                service._parallel = ParallelBatch(2, {})
+                class BrokenPool(FakePool):
+                    def estimate(self, rgb, language="zh"):
+                        if isinstance(error, InferenceFailure):
+                            raise error
+                        raise InferenceFailure(500, str(error)) from error
+                self.factory.side_effect = BrokenPool
+                result = service._estimate(IMAGE, True, True)[1]
+                self.assertEqual(result.humans, [1])
+                self.assertTrue(service._estimator.loaded)
+                info = service._model_info()["parallel"]
+                self.assertIsNotNone(info["disabled"])
+                self.assertFalse(info["loaded"])
+                self.assertIsNone(service._parallel._pool)
+                # 之后的批量请求直接走串行，不再尝试共享模型
+                self.factory.reset_mock()
+                service._estimate(IMAGE, True, True)
+                self.factory.assert_not_called()
+
+    def test_single_request_failure_retries_serially_without_disabling(self):
+        class FlakyPool(FakePool):
+            def estimate(self, rgb, language="zh"):
+                raise InferenceFailure(500, "ValueError: bad image")
+        self.factory.side_effect = FlakyPool
+        self.configure(2)
+        result = service._estimate(IMAGE, True, True)[1]
+        self.assertEqual(result.humans, [1])
+        self.assertIsNone(service._parallel.disabled)
+
+    def test_environment_switch_keeps_everything_serial(self):
+        service._parallel = ParallelBatch(4, {}, disabled="POSEGRAPH_DISABLE_PARALLEL=1")
+        service._estimate(IMAGE, True, True)
+        self.factory.assert_not_called()
+        self.assertTrue(service._estimator.loaded)
+        self.assertEqual(service._model_info()["parallel"]["disabled"], "POSEGRAPH_DISABLE_PARALLEL=1")
+
+    def test_serial_request_during_parallel_batch_uses_shared_model(self):
+        entered, release = threading.Event(), threading.Event()
+        class BlockingPool(FakePool):
+            def estimate(self, rgb, language="zh"):
+                result = super().estimate(rgb, language)
+                if rgb == 0:
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError("test did not release inference")
+                return result
+        self.factory.side_effect = BlockingPool
+        self.configure(2)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                batch = executor.submit(service._estimate, 0, True, True)
+                self.assertTrue(entered.wait(3))
+                service._estimate(1, False, False)
+                pool = service._parallel._pool
+                self.assertEqual(pool.estimates, 2)
+                self.assertFalse(service._estimator.loaded)
+                release.set()
+                batch.result(3)
+            finally:
+                release.set()
+        # 批次结束、共享模型空闲时，单张识别先关掉共享模型再加载串行模型
+        service._estimate(2, False, False)
+        self.assertTrue(pool.closed)
+        self.assertTrue(service._estimator.loaded)
+
+    def test_release_immediately_closes_shared_model_after_unheld_request(self):
+        self.configure(2, release_after=0)
+        service._estimate(IMAGE, True, True)
+        pool = service._parallel._pool
+        self.assertFalse(pool.closed)
+        service._unload_model()   # 插件在批次结束时调用
+        self.assertTrue(pool.closed)
+        self.assertFalse(service._held)
+        service._estimate(IMAGE, False, True)
+        self.assertIsNone(service._parallel._pool)
+        self.assertFalse(service._model_info()["loaded"])
+
+    def test_config_changes_rebuild_idle_shared_model(self):
         with TestClient(service.app) as client:
-            response = client.post("/model/config", json={"recognition_parallelism": 2})
-            self.assertEqual(response.status_code, 200)
-            service._load_model()
-            previous = service._parallel_pool
+            self.assertEqual(client.post("/model/config", json={"recognition_parallelism": 2}).status_code, 200)
+            service._estimate(IMAGE, True, True)
+            previous = service._parallel._pool
             for payload in ({"recognition_parallelism": 3},
                             {"device": "cuda", "release_after": 60, "mhr_on_cpu": False}):
                 response = client.post("/model/config", json=payload)
@@ -66,90 +166,7 @@ class SharedStrategyApiTests(unittest.TestCase):
             self.assertEqual(config["device"], "cuda")
             self.assertEqual(config["releaseAfter"], 60)
             self.assertFalse(config["mhrOnCpu"])
-
-    def test_shared_capacity_is_not_reported_as_multiple_loaded_models(self):
-        service.model_config(service.ModelConfig(recognition_parallelism=3))
-        self.assertEqual(service._model_info()["modelCopies"], 0)
-        service._load_model()
-        info = service._model_info()
-        self.assertEqual(info["modelCopies"], 1)
-        self.assertEqual(len(info["workers"]), 1)
-        self.assertEqual(info["config"]["recognitionParallelism"], 3)
-
-    def test_switching_back_closes_shared_owner_before_serial_load(self):
-        service.model_config(service.ModelConfig(recognition_parallelism=2))
-        service._load_model()
-        old = service._parallel_pool
-        service.model_config(service.ModelConfig(recognition_parallelism=1))
-        self.assertTrue(old.closed)
-        self.assertIsNone(service._parallel_pool)
-        service._load_model()
-        self.assertTrue(service._estimator.loaded)
-
-    def test_failed_close_preserves_config_and_same_request_retries_shutdown(self):
-        class FlakyPool(FakePool):
-            closes = 0
-            def close(self):
-                self.closes += 1
-                self.closed = True  # Real shared shutdown also rejects new leases before unloading.
-                if self.closes == 1:
-                    raise InferenceFailure(500, "first shutdown failed")
-                self.loaded = False
-        self.factory.side_effect = FlakyPool
-        service.model_config(service.ModelConfig(recognition_parallelism=3))
-        service._load_model()
-        original = service._parallel_pool
-        update = service.ModelConfig(recognition_parallelism=1,
-                                     device="cuda", mhr_on_cpu=False, min_free_vram_mb=4000, release_after=60)
-        with self.assertRaisesRegex(InferenceFailure, "first shutdown failed"):
-            service.model_config(update)
-        self.assertIs(service._parallel_pool, original)
-        self.assertEqual(service._recognition_parallelism, 3)
-        self.assertEqual(service._estimator.device, "cpu")
-        self.assertTrue(service._estimator.mhr_on_cpu)
-        self.assertEqual(service._estimator.min_free_vram_mb, 3000)
-        self.assertEqual(service._release_after, -1)
-        # Repeating the same JSON request must not be mistaken for an already
-        # applied update while the retained original pool is closing.
-        response = service.model_config(update)
-        self.assertEqual(original.closes, 2)
-        self.assertIsNone(service._parallel_pool)
-        self.assertEqual(response["model"]["config"]["recognitionParallelism"], 1)
-        self.assertEqual(service._recognition_parallelism, 1)
-        self.assertEqual(service._estimator.device, "cuda")
-        self.assertFalse(service._estimator.mhr_on_cpu)
-        self.assertEqual(service._estimator.min_free_vram_mb, 4000)
-        self.assertEqual(service._release_after, 60)
-        service._load_model()
-        self.assertTrue(service._estimator.loaded)
-
-    def test_successful_pool_retry_clears_only_stale_global_preload_error(self):
-        class RecoverablePool(FakePool):
-            worker_error = None
-            def preload(self, language):
-                raise InferenceFailure(503, "fake preload failure")
-            @property
-            def states(self):
-                states = super().states
-                states[0]["error"] = self.worker_error
-                return states
-        self.factory.side_effect = RecoverablePool
-        service.model_config(service.ModelConfig(recognition_parallelism=2))
-        with self.assertRaisesRegex(InferenceFailure, "fake preload failure"):
-            service._load_model()
-        self.assertIn("fake preload failure", service._model_info()["error"])
-        with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
-            service._estimate(b"image")
-        self.assertTrue(service._model_info()["loaded"])
-        self.assertIsNone(service._model_info()["error"])
-        # Another slot's real error remains visible even if this request succeeds.
-        pool = service._parallel_pool
-        pool.worker_error = "another worker failed"
-        service._model_state["error"] = "older preload failure"
-        with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
-            service._estimate(b"image")
-        self.assertIsNone(service._model_state["error"])
-        self.assertEqual(service._model_info()["error"], "another worker failed")
+            self.assertEqual(service._parallel.config["device"], "cuda")
 
     def test_invalid_parallelism_is_rejected_without_creating_a_model(self):
         with TestClient(service.app) as client:
@@ -162,57 +179,18 @@ class SharedStrategyApiTests(unittest.TestCase):
 
     def test_serial_hold_retains_model_until_nonheld_request(self):
         service._release_after = 0
-        with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
-            service._estimate(b"image", hold=True)
-            self.assertTrue(service._estimator.loaded)
-            self.assertTrue(service._held)
-            service._estimate(b"image", hold=False)
+        service._estimate(IMAGE, hold=True)
+        self.assertTrue(service._estimator.loaded)
+        self.assertTrue(service._held)
+        service._estimate(IMAGE, hold=False)
         self.assertFalse(service._estimator.loaded)
         self.assertFalse(service._held)
 
-    def test_parallel_hold_protects_nonheld_peers_and_next_group_can_release(self):
-        entered = [threading.Event(), threading.Event()]
-        release = [threading.Event(), threading.Event()]
-        class BlockingPool(FakePool):
-            def estimate(self, rgb, language="zh"):
-                result = super().estimate(rgb, language)
-                if rgb < 2:
-                    entered[rgb].set()
-                    if not release[rgb].wait(3):
-                        raise RuntimeError("test did not release inference")
-                return result
-        service.model_config(service.ModelConfig(recognition_parallelism=2, release_after=0))
-        with patch.object(service, "SharedInferencePool", side_effect=BlockingPool), \
-                patch.object(service, "_decode", side_effect=lambda data: data), \
-                ThreadPoolExecutor(max_workers=2) as executor:
-            try:
-                first = executor.submit(service._estimate, 0, False)
-                self.assertTrue(entered[0].wait(3))
-                second = executor.submit(service._estimate, 1, True)
-                self.assertTrue(entered[1].wait(3))
-                pool = service._parallel_pool
-                release[0].set()
-                first.result(3)
-                self.assertFalse(pool.closed)
-                release[1].set()
-                second.result(3)
-                self.assertFalse(pool.closed)
-                self.assertTrue(service._held)
-                self.assertEqual(service._active_pool_requests, 0)
-                service._estimate(2, False)
-                self.assertTrue(pool.closed)
-                self.assertFalse(service._held)
-                self.assertEqual(pool.estimates, 3)
-            finally:
-                for event in release:
-                    event.set()
-
     def test_hold_idle_timeout_releases_serial_and_parallel_models(self):
-        for parallelism in (1, 2):
-            with self.subTest(parallelism=parallelism):
-                service.model_config(service.ModelConfig(recognition_parallelism=parallelism, release_after=0))
-                with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
-                    service._estimate(b"image", hold=True)
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel):
+                self.configure(2, release_after=0)
+                service._estimate(IMAGE, True, parallel)
                 self.assertTrue(service._model_info()["loaded"])
                 with patch.object(service.time, "monotonic", return_value=service._last_used + service.HOLD_TIMEOUT - 1):
                     service._release_idle_models()
@@ -222,48 +200,8 @@ class SharedStrategyApiTests(unittest.TestCase):
                 self.assertFalse(service._model_info()["loaded"])
                 self.assertFalse(service._held)
 
-    def test_idle_release_loop_retries_failed_close_even_after_weights_unloaded(self):
-        class PartiallyUnloadedEstimator(FakeEstimator):
-            attempts = 0
-            def unload(self):
-                self.attempts += 1
-                super().unload()
-                if self.attempts == 1:
-                    raise ValueError("cleanup failed after weights unloaded")
-        class StopLoop(BaseException):
-            pass
-        owner = PartiallyUnloadedEstimator()
-        pool = SharedInferencePool(2, {}, lambda _: owner)
-        pool.preload()
-        service._parallel_pool = pool
-        service._recognition_parallelism, service._release_after = 2, 0
-        service._held, service._last_used = True, 0
-        ticks = 0
-        def tick(_):
-            nonlocal ticks
-            ticks += 1
-            if ticks == 2:
-                self.assertIs(service._parallel_pool, pool)
-                self.assertFalse(pool.states[0]["loaded"])
-                self.assertTrue(pool.states[0]["closing"])
-                self.assertIn("cleanup failed", service._model_info()["error"])
-            if ticks == 3:
-                raise StopLoop()
-        with patch.object(service.time, "sleep", side_effect=tick), \
-                patch.object(service.time, "monotonic", return_value=service.HOLD_TIMEOUT + 1):
-            with self.assertRaises(StopLoop):
-                service._release_loop()
-        self.assertEqual(owner.attempts, 2)
-        self.assertIsNone(service._parallel_pool)
-        self.assertFalse(service._held)
-        self.assertIsNone(service._model_info()["error"])
-        # Successful cleanup must also allow a fresh model to be admitted.
-        service._load_model()
-        self.assertTrue(service._model_info()["loaded"])
-
-    def test_hold_does_not_bypass_exclusive_unload_or_configuration(self):
-        for action in (service._unload_model,
-                       lambda: service.model_config(service.ModelConfig(device="cuda"))):
+    def test_unload_and_configuration_wait_for_parallel_inference(self):
+        for action in (service._unload_model, lambda: self.configure(2, device="cuda")):
             with self.subTest(action=action):
                 entered, release, writer_started = threading.Event(), threading.Event(), threading.Event()
                 class BlockingPool(FakePool):
@@ -273,17 +211,16 @@ class SharedStrategyApiTests(unittest.TestCase):
                         if not release.wait(3):
                             raise RuntimeError("test did not release inference")
                         return result
+                self.factory.side_effect = BlockingPool
+                self.configure(2, device="cpu", release_after=0)
                 def change():
                     writer_started.set()
                     return action()
-                service.model_config(service.ModelConfig(recognition_parallelism=2, device="cpu", release_after=0))
-                with patch.object(service, "SharedInferencePool", side_effect=BlockingPool), \
-                        patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)), \
-                        ThreadPoolExecutor(max_workers=2) as executor:
+                with ThreadPoolExecutor(max_workers=2) as executor:
                     try:
-                        recognition = executor.submit(service._estimate, b"image", True)
+                        recognition = executor.submit(service._estimate, IMAGE, True, True)
                         self.assertTrue(entered.wait(3))
-                        pool = service._parallel_pool
+                        pool = service._parallel._pool
                         writer = executor.submit(change)
                         self.assertTrue(writer_started.wait(3))
                         self.assertFalse(release.wait(.05))
@@ -293,16 +230,19 @@ class SharedStrategyApiTests(unittest.TestCase):
                         recognition.result(3)
                         writer.result(3)
                         self.assertTrue(pool.closed)
-                        self.assertFalse(service._held)
                     finally:
                         release.set()
 
-    def test_create_session_forwards_hold_query(self):
-        with patch.object(service, "_estimate", side_effect=service.HTTPException(422, "fake result")) as estimate, \
-                TestClient(service.app) as client:
-            response = client.post("/sessions?hold=true", content=b"image")
-        self.assertEqual(response.status_code, 422)
-        estimate.assert_called_once_with(b"image", True)
+    def test_create_session_forwards_hold_and_parallel_query(self):
+        for query, expected in (("hold=true", (b"image", True, False)),
+                                ("hold=true&parallel=true", (b"image", True, True)),
+                                ("name=x", (b"image", False, False))):
+            with self.subTest(query=query), \
+                    patch.object(service, "_estimate", side_effect=service.HTTPException(422, "fake result")) as estimate, \
+                    TestClient(service.app) as client:
+                response = client.post(f"/sessions?{query}", content=b"image")
+                self.assertEqual(response.status_code, 422)
+                estimate.assert_called_once_with(*expected)
 
     def test_multiview_writeback_uses_current_cache_and_keeps_delete_final(self):
         from posegraph.session_cache import Session, SessionCache
@@ -315,7 +255,7 @@ class SharedStrategyApiTests(unittest.TestCase):
         with patch.object(service, "_sessions", cache), \
                 patch("posegraph.multiview.describe", return_value=views), \
                 patch("posegraph.multiview.fuse", return_value=fused):
-            # Reading aux spills the main session while fusion still holds its old object.
+            # 读辅助图会把主图挤到磁盘，融合时手里拿的还是旧对象
             self.assertEqual(service.session_views("base", service.ViewsRequest(aux=["aux"])), {"views": views})
             self.assertEqual(cache["base"].fused, fused)
             self.assertEqual(service._human(cache["base"], 0), fused)

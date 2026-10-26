@@ -89,12 +89,15 @@ def _language(language: str):
 class SharedInferencePool:
     """At most N inferences, one owner/model; close waits for active requests."""
 
-    def __init__(self, parallelism: int, config: dict, factory: Callable = create_shared_estimator):
+    def __init__(self, parallelism: int, config: dict, factory: Callable = create_shared_estimator,
+                 on_loaded: Callable | None = None):
         if isinstance(parallelism, bool) or not isinstance(parallelism, int) or not 1 <= parallelism <= 8:
             raise ValueError("parallelism must be an integer in 1..8")
         self.parallelism = parallelism
         self.config = dict(config)
         self.factory = factory
+        # 加载完成后回调 on_loaded(owner) -> 实际路数（按显存 / 内存余量收紧并发上限，见 parallel_batch.py）
+        self.on_loaded = on_loaded
         self._condition = threading.Condition(threading.RLock())
         self._owner = None
         self._active = 0
@@ -157,6 +160,10 @@ class SharedInferencePool:
             owner.load()
             if not owner.loaded:
                 raise RuntimeError("Shared model load completed without a loaded model")
+            if self.on_loaded is not None:
+                limit = self.on_loaded(owner)
+                with self._condition:
+                    self.parallelism = max(1, min(self.parallelism, int(limit)))
         except BaseException as error:
             failure = error
             if self._owner is not None:

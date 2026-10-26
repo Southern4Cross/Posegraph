@@ -13,8 +13,7 @@ var checks = new (string Name, Func<Task> Run)[]
     ("Accepts default one on older backend without confirmation", DefaultCompatible),
     ("Propagates non-success HTTP status and backend detail", BackendError),
     ("Sends current Accept-Language on every configuration request", LanguageHeader),
-    ("Preserves batch hold and escaped image names", BatchHold),
-    ("Uses one-model base resources for GPU, CPU, MHR and auto fallback", ResourceBaseBudget),
+    ("Preserves batch hold, parallel flag and escaped image names", BatchHold),
 };
 
 foreach (var (name, run) in checks)
@@ -22,7 +21,7 @@ foreach (var (name, run) in checks)
     await run().WaitAsync(TimeSpan.FromSeconds(20));
     Console.WriteLine($"PASS {name}");
 }
-Console.WriteLine($"{checks.Length} BackendClient/resource checks passed (production source linked, real loopback HTTP).");
+Console.WriteLine($"{checks.Length} BackendClient checks passed (production source linked, real loopback HTTP).");
 
 static string Confirmation(int count)
     => JsonSerializer.Serialize(new { model = new { config = new { recognitionParallelism = count } } });
@@ -141,36 +140,20 @@ static async Task LanguageHeader()
 static async Task BatchHold()
 {
     const string response = "{\"sessionId\":\"check\",\"name\":\"image\",\"imageSize\":[1,1],\"inferenceMs\":1,\"device\":\"cpu\",\"humans\":[]}";
-    using var backend = new LocalBackend(new MockResponse(200, response), new MockResponse(200, response));
+    using var backend = new LocalBackend(new MockResponse(200, response), new MockResponse(200, response), new MockResponse(200, response));
     using var client = new BackendClient(() => backend.Port);
     const string name = "中文 & image?";
     await client.CreateSessionAsync([1], name, hold: true);
     await client.CreateSessionAsync([2], name);
+    await client.CreateSessionAsync([3], name, hold: true, parallel: true);
     var requests = await backend.Requests;
     Assert(requests.All(request => request.Method == "POST" && request.Path == "/sessions" &&
         request.Query!.Contains("name=" + Uri.EscapeDataString(name)) && request.Language == Loc.Lang),
         "Session request lost its name or language");
     Assert(requests[0].Query!.EndsWith("&hold=true") && !requests[1].Query!.Contains("hold="),
         "Batch hold was lost or applied to an ordinary foreground request");
-}
-
-static Task ResourceBaseBudget()
-{
-    var gpu = RecognitionResources.Estimate("cuda", true);
-    Assert(gpu.Scenario == RecognitionResourceScenario.Gpu && gpu.VramMB == SystemProbe.RequiredVramMB &&
-        gpu.RamMB == SystemProbe.RequiredRamMB, "Single-model baseline changed");
-    var mhr = RecognitionResources.Estimate("cuda", false);
-    Assert(mhr.VramMB == gpu.VramMB + 750 && mhr.RamMB == gpu.RamMB, "MHR allowance must be added only once");
-    var cpu = RecognitionResources.Estimate("cpu", true);
-    Assert(cpu.Scenario == RecognitionResourceScenario.Cpu && cpu.VramMB == 0 && cpu.RamMB == gpu.RamMB &&
-        cpu == RecognitionResources.Estimate("cpu", false), "CPU mode must ignore GPU/MHR VRAM allowances");
-    foreach (var device in new[] { "auto", "unknown", "" })
-    {
-        var automatic = RecognitionResources.Estimate(device, true);
-        Assert(automatic.Scenario == RecognitionResourceScenario.Auto && automatic.VramMB == gpu.VramMB &&
-            automatic.RamMB == gpu.RamMB, "Unknown/auto device must retain a qualified GPU planning scenario");
-    }
-    return Task.CompletedTask;
+    Assert(!requests[0].Query!.Contains("parallel=") && !requests[1].Query!.Contains("parallel=") &&
+        requests[2].Query!.EndsWith("&hold=true&parallel=true"), "Parallel flag was lost or sent without being asked for");
 }
 
 static void Assert(bool condition, string message)

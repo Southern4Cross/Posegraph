@@ -1,11 +1,34 @@
-# 并行识别 / Parallel recognition
+# 并行识别（实验）/ Parallel recognition (experimental)
 
-设置中的并行数 **1** 使用原串行识别；**2～8** 隔离请求状态、共享一份模型权重。设回 1 即可回退，无需选择策略。
-Concurrency 1 keeps the original serial path; 2–8 share model weights. Set 1 to fall back.
-后端启动环境为 `POSEGRAPH_RECOGNITION_PARALLELISM`；也可向 `POST /model/config` 发送 `{"recognition_parallelism":3}`。
-更多并发仍会增加激活、缓存、内存 / 显存和单次请求延迟，不是额外资源为零。
+共享模型实现来自 [PR #2](https://github.com/extrant/Posegraph/pull/2)（uiharuayako），合并时改成了可以随时关掉、出问题不影响识别的形式：
 
-## 单机实测 / Measurements
+- **只用于图库批量识别**：插件设置「多图识别并行数」大于 1 时，批量队列的请求带 `parallel=true`；单张识别、辅助视角、预加载都走原来的串行路径。
+- **出问题交回串行**：共享模型加载失败、上游源码指纹不符、运行时校验不通过时，后端本进程内停用并行，这一张改用串行重试，
+  `/health` 的 `model.parallel.disabled` 写明原因，插件提示一次；单张请求出错也交回串行重试，不让识别失败。
+- **按余量定路数**：共享模型加载后，GPU 按剩余显存（留 1GB，每路按 250MB 算），CPU 按可用内存（留 3GB，每路按 450MB 算）
+  和核数（每路至少 2 线程）削减路数；CPU 模式下每路 PyTorch 线程数 = 核数 ÷ 路数，并行结束后恢复。
+- **内存里只有一份模型**：换用共享模型前卸掉串行模型；批量并行进行中夹进来的单张也交给共享模型。
+- **开关**：插件里设回 1；或后端环境变量 `POSEGRAPH_DISABLE_PARALLEL=1` 完全关掉。
+
+代码隔离：后端 `parallel_batch.py`（调度、降级、预算）+ `shared_inference.py` / `estimators/shared_sam3d.py`（PR 原实现）；
+插件 `Library/RecognitionService.Parallel.cs`、`Backend/BackendClient.Parallel.cs`、`UI/MainWindow.RecognitionSettings.cs`。
+要彻底去掉：删掉这些文件，以及 `RecognitionService.WorkAsync` 里调用 `DrainParallelAsync` 的一行、`app.py` 里 `_parallel` 的几处调用。
+
+Batch recognition only (requests flagged `parallel=true`); single images stay serial. Any shared-model failure disables parallel
+recognition for the backend process and retries the image serially. Slots are limited by free VRAM / RAM and cores; CPU threads are
+split across slots. Turn it off with concurrency 1 or `POSEGRAPH_DISABLE_PARALLEL=1`.
+
+## 合并后实测 / Measurements after integration
+
+RTX 4060 Laptop 8GB / i7 20 线程，图库实拍图，含模型加载时间：
+
+| 场景 | 串行 | 并行 | 结果差异 |
+|---|---:|---:|---|
+| GPU，8 张，并行 3 | 28.8 秒，显存 +1924MB | 18.5 秒，显存 +2255MB | 逐元素一致 |
+| GPU，指纹不符（降级） | 25.1 秒（6 张） | 19.3 秒，全部成功，显存 +1977MB | 逐元素一致 |
+| CPU，4 张，并行 4 | 70.7 秒 | 53.4 秒 | ≤0.34mm（与串行两次加载之间的浮点差同量级） |
+
+## PR #2 作者实测 / Measurements by the PR author
 
 CPU i7-13700KF / Torch 2.11.0+cpu / fp32；GPU RTX 4070 Ti 12 GB / Torch 2.11.0+cu128 / bf16，MHR 在 CPU。
 N1 / 3～8 来自文末固定实验快照 `6524422`；N2 在精简集成版按相同协议补测。
