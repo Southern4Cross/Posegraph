@@ -6,6 +6,11 @@ Turn a photo or an illustration into a pose for your FINAL FANTASY XIV character
 
 **New here? Start with the [step-by-step tutorial](docs/tutorial/README.md)** (with screenshots).
 
+<p>
+  <img src="docs/tutorial/images/ingame-wall.jpg" alt="Leaning on a wall" width="49%">
+  <img src="docs/tutorial/images/ingame-kalaripayattu.jpg" alt="Martial arts leap" width="49%">
+</p>
+
 Posegraph is a Dalamud plugin with a local AI backend. Pick an image in game, and the backend recognizes the
 3D body pose with Meta's [SAM 3D Body](https://github.com/facebookresearch/sam-3d-body), retargets it onto the
 FFXIV skeleton of your race, and the plugin applies it to your GPose actor through [Brio](https://github.com/Etheirys/Brio).

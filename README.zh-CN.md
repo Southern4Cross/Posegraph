@@ -6,6 +6,11 @@
 
 **第一次用？先看[图文教程](docs/tutorial/README.zh-CN.md)。**
 
+<p>
+  <img src="docs/tutorial/images/ingame-wall.jpg" alt="倚墙" width="49%">
+  <img src="docs/tutorial/images/ingame-kalaripayattu.jpg" alt="武术腾空" width="49%">
+</p>
+
 Posegraph 是一个 Dalamud 插件，配合本地运行的 AI 后端。在游戏里选一张图，后端用 Meta 的
 [SAM 3D Body](https://github.com/facebookresearch/sam-3d-body) 识别 3D 人体姿态，重定向到你所在种族的 FF14 骨架上，
 插件再通过 [Brio](https://github.com/Etheirys/Brio) 应用到 GPose 角色。
