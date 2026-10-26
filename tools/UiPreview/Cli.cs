@@ -44,7 +44,7 @@ public static class Cli
         using var host = new Host(new Vector2(1600, 1000), scale);
         Tutorial.Register(Scenes.All);
         var app = new App(host, lang, demo);
-        foreach (var name in scenes.SelectMany(s => s == "all" ? Scenes.All.Keys.ToList() : [s]))
+        foreach (var name in scenes.SelectMany(s => s == "all" ? Scenes.All.Keys.Where(k => !k.StartsWith("bench-")).ToList() : [s]))
         {
             if (!Scenes.All.TryGetValue(name, out var scene))
             {

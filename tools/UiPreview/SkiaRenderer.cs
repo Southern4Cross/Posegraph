@@ -12,19 +12,43 @@ public sealed class SkiaRenderer
     private readonly Dictionary<ulong, SKImage> _textures = new();
     private ulong _next = 1;
 
+    // 纹理在后台线程创建 / 释放（与 Dalamud 一样异步），注册表要加锁
     public ulong Register(SKImage image)
     {
-        var id = _next++;
-        _textures[id] = image;
-        return id;
+        lock (_textures)
+        {
+            var id = _next++;
+            _textures[id] = image;
+            return id;
+        }
     }
 
     public void Unregister(ulong id)
     {
-        if (_textures.Remove(id, out var image)) image.Dispose();
+        SKImage? image;
+        lock (_textures)
+            if (!_textures.Remove(id, out image)) return;
+        image.Dispose();
     }
 
-    public SKImage? Get(ulong id) => _textures.GetValueOrDefault(id);
+    public SKImage? Get(ulong id)
+    {
+        lock (_textures) return _textures.GetValueOrDefault(id);
+    }
+
+    /// <summary>这一帧的绘制命令里引用了已释放纹理的次数（真机上是显卡驱动访问已释放资源）。</summary>
+    public unsafe int CountReleasedTextures(ImDrawDataPtr data)
+    {
+        var missing = 0;
+        var lists = data.Handle->CmdLists;
+        for (var l = 0; l < data.CmdListsCount; l++)
+        {
+            var cmds = lists[l]->CmdBuffer;
+            for (var c = 0; c < cmds.Size; c++)
+                if (cmds.Data[c].ElemCount > 0 && Get(cmds.Data[c].TextureId.Handle) is null) missing++;
+        }
+        return missing;
+    }
 
     public unsafe void Render(ImDrawDataPtr data, SKCanvas canvas)
     {
@@ -39,7 +63,7 @@ public sealed class SkiaRenderer
             for (var c = 0; c < cmds.Size; c++)
             {
                 var cmd = cmds.Data[c];
-                if (cmd.ElemCount == 0 || !_textures.TryGetValue(cmd.TextureId.Handle, out var tex)) continue;
+                if (cmd.ElemCount == 0 || Get(cmd.TextureId.Handle) is not { } tex) continue;
                 var solidPos = new List<SKPoint>();
                 var solidCol = new List<SKColor>();
                 var texPos = new List<SKPoint>();

@@ -45,13 +45,20 @@ public static class Scenes
             app.Shot(path, Draw, [app.Main.WindowName]);
             app.Main.Size = new Vector2(420, 560);
         },
+        // 压力测试（不截图，打印统计；不包含在 all 里）：几千张图的文件夹里连续滚动
+        ["bench-library"] = (app, _) => Stress.Library(app,
+            Environment.GetEnvironmentVariable("STRESS_SAMPLES") ?? @"D:\SirenCode\根据图片获取动作\测试图片"),
+        ["bench-wic"] = (_, _) => Stress.Wic(),
         ["library"] = (app, path) =>
         {
             app.Library.IsOpen = true;
             app.Library.Position = new Vector2(40, 40);
-            // 图库后台列目录，多画几帧等它
-            app.Shot(path, () => Host.DrawWindow(app.Library), [app.Library.WindowName], frames: 3);
-            Thread.Sleep(1500);
+            // 列目录、缩略图都在后台：边画边等（不画的话缩略图会被当成已滚出视野、暂不解码）
+            for (var i = 0; i < 20; i++)
+            {
+                Host.Current.Frame(() => Host.DrawWindow(app.Library));
+                Thread.Sleep(100);
+            }
             app.Shot(path, () => Host.DrawWindow(app.Library), [app.Library.WindowName], frames: 3);
         },
         // 压力测试：最小宽度、长状态、调整页有未保存的修改（主窗口有会话但没有图，只看排版）
