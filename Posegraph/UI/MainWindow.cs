@@ -1407,7 +1407,8 @@ public sealed class MainWindow : Window, IDisposable
         }
         DrawCorrectionBar();
         var avail = ImGui.GetContentRegionAvail();
-        var panel = _selected is null ? ImGui.GetTextLineHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
+        // 下方面板：没选关节时是一行勾选框（按控件行高留，按文字行高会被切掉一截）
+        var panel = _selected is null ? ImGui.GetFrameHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
         var size = new Vector2(avail.X, Math.Max(140, avail.Y - panel));
         var origin = ImGui.GetCursorScreenPos();
         ImGui.InvisibleButton("##stick", size);
@@ -1934,10 +1935,12 @@ public sealed class MainWindow : Window, IDisposable
             }
             ItemTip(Loc.T(tip));
         }
-        ImGui.SetNextItemWidth(180);
+        // 下拉框占满到右侧标签前（英文选项更长），放不下时省略
+        var releaseW = Math.Max(180 * ImGuiHelpers.GlobalScale, ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(Loc.T("模型释放")).X - ImGui.GetStyle().ItemInnerSpacing.X);
+        ImGui.SetNextItemWidth(releaseW);
         var current = ReleasePolicies.FirstOrDefault(p => p.Seconds == _config.ReleaseAfter).Label is { } known
             ? Loc.T(known) : Loc.F("空闲 {0} 秒后释放", _config.ReleaseAfter);
-        if (ImGui.BeginCombo(Loc.T("模型释放"), current))
+        if (ImGui.BeginCombo(Loc.T("模型释放"), UiText.ComboPreview(current, releaseW)))
         {
             foreach (var (seconds, label) in ReleasePolicies)
                 if (ImGui.Selectable(Loc.T(label), _config.ReleaseAfter == seconds))
