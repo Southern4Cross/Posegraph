@@ -5,6 +5,27 @@
 这份教程带你从安装到把一张照片的姿势摆到 GPose 角色身上，再介绍图库、辅助视角和多角色这些进阶功能。
 截图里的数字对应右侧的说明。界面截图由 [离线截图工具](../../tools/UiPreview) 生成，示例照片的来源见文末。
 
+**效果展示**：教程里的四张示例照片识别后摆到游戏角色身上（人族中原男，复刻了照片镜头）：
+
+<table>
+  <tr>
+    <td><img src="images/ingame-wall.jpg" alt="倚墙" width="400"></td>
+    <td><img src="images/ingame-arms-open.jpg" alt="张开双臂" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center">倚墙</td>
+    <td align="center">张开双臂</td>
+  </tr>
+  <tr>
+    <td><img src="images/ingame-sit-wall.jpg" alt="坐在高台上" width="400"></td>
+    <td><img src="images/ingame-kalaripayattu.jpg" alt="武术腾空" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center">坐在高台上</td>
+    <td align="center">武术腾空（图里有两个人；目前整张图按一个人识别，这里识别到的是腾空的那位）</td>
+  </tr>
+</table>
+
 ## 目录
 
 1. [准备工作](#1-准备工作)
@@ -69,7 +90,9 @@
 
 ![识别结果](images/zh/tut-image.png)
 
-> **游戏内效果截图待补**：应用后的角色（建议文件名 `images/ingame-apply.png`）。
+应用后的效果（这张还用了下面的「复刻镜头」，镜头也和照片一致）：
+
+![应用到角色后](images/ingame-wall.jpg)
 
 小技巧：
 
@@ -162,7 +185,9 @@
 - **还原**（↶）：回到第一次应用前的姿势。
 - **导出**（磁盘图标）：导出 `.pose` 文件，或存到 Brio 姿势库（带预览图和标签，在 Brio 资料库里直接能用）。
 
-> **游戏内效果截图待补**：复刻镜头前后对比（建议文件名 `images/ingame-camera.png`）。
+复刻镜头后，状态栏会显示机位误差和构图偏差（这张是 0.4cm、6.2%）：
+
+![复刻镜头](images/ingame-arms-open.jpg)
 
 ## 12. 更新
 

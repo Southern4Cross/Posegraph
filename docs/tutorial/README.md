@@ -6,6 +6,27 @@ This tutorial takes you from installation to putting a photo's pose on your GPos
 library, extra views and posing several characters. The numbers in each screenshot match the notes on its right.
 The UI screenshots are made with the [offline screenshot tool](../../tools/UiPreview); the sample photos are credited at the end.
 
+**Results**: the tutorial's four sample photos recognized and put on an in-game character (Midlander male, with the photo's camera matched):
+
+<table>
+  <tr>
+    <td><img src="images/ingame-wall.jpg" alt="Leaning on a wall" width="400"></td>
+    <td><img src="images/ingame-arms-open.jpg" alt="Arms open" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center">Leaning on a wall</td>
+    <td align="center">Arms open</td>
+  </tr>
+  <tr>
+    <td><img src="images/ingame-sit-wall.jpg" alt="Sitting on a ledge" width="400"></td>
+    <td><img src="images/ingame-kalaripayattu.jpg" alt="Martial arts leap" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center">Sitting on a ledge</td>
+    <td align="center">Martial arts leap (two people in the photo; the whole image is treated as one person for now, and it picked the one in the air)</td>
+  </tr>
+</table>
+
 ## Contents
 
 1. [Before you start](#1-before-you-start)
@@ -73,7 +94,9 @@ character's appearance, so you rarely need to change it.
 
 ![Recognition result](images/en/tut-image.png)
 
-> **In-game screenshot to come**: the character after applying (suggested file name `images/ingame-apply.png`).
+The result (this one also used "Match camera" below, so the camera matches the photo too):
+
+![After applying](images/ingame-wall.jpg)
 
 Tips:
 
@@ -168,7 +191,9 @@ Buttons at the bottom of the main window:
 - **Restore** (↶): goes back to the pose before the first apply.
 - **Export** (disk icon): export a `.pose` file, or save to the Brio pose library (with preview and tags, ready in Brio's library).
 
-> **In-game screenshot to come**: before/after camera matching (suggested file name `images/ingame-camera.png`).
+After matching, the status line shows the camera position and framing error (0.4 cm and 6.2% here):
+
+![Camera matching](images/ingame-arms-open.jpg)
 
 ## 12. Updates
 
