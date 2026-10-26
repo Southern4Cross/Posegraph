@@ -8,7 +8,7 @@ using SkiaSharp;
 namespace UiPreview;
 
 /// <summary>
-/// 用法：UiPreview [场景…] [--out 目录] [--lang zh|en] [--scale 1.0]
+/// 用法：UiPreview [场景…] [--out 目录] [--lang zh|en] [--scale 1.0] [--demo 示例图目录]
 /// 不给场景时列出全部场景。每个场景输出一张 PNG（按窗口裁切，带一点边距）。
 /// </summary>
 public static class Cli
@@ -22,6 +22,7 @@ public static class Cli
         var outDir = Path.Combine(Environment.CurrentDirectory, "shots");
         var lang = "zh";
         var scale = 1f;
+        string? demo = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -29,6 +30,7 @@ public static class Cli
                 case "--out": outDir = args[++i]; break;
                 case "--lang": lang = args[++i]; break;
                 case "--scale": scale = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                case "--demo": demo = args[++i]; break;
                 default: scenes.Add(args[i]); break;
             }
         }
@@ -40,7 +42,8 @@ public static class Cli
         Directory.CreateDirectory(outDir);
         Console.Error.WriteLine("[cli] 初始化 ImGui");
         using var host = new Host(new Vector2(1600, 1000), scale);
-        var app = new App(host, lang);
+        Tutorial.Register(Scenes.All);
+        var app = new App(host, lang, demo);
         foreach (var name in scenes.SelectMany(s => s == "all" ? Scenes.All.Keys.ToList() : [s]))
         {
             if (!Scenes.All.TryGetValue(name, out var scene))
@@ -84,7 +87,7 @@ public sealed class App
         => typeof(MainWindow).GetField("_selectTab", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
                              .SetValue(Main, index);
 
-    public App(Host host, string lang)
+    public App(Host host, string lang, string? demoSamples = null)
     {
         Host = host;
         Console.Error.WriteLine("[app] 创建服务");
@@ -103,6 +106,11 @@ public sealed class App
         Main = new MainWindow(Config, pi, clientState, textures, readback, dragDrop, brio,
                               new PoseApplier(framework, clientState, targets, brio),
                               new BridgeServer(framework, clientState, targets, brio, log));
+        if (demoSamples is not null)
+        {
+            Demo.Enabled = true;
+            Demo.Setup(this, demoSamples);
+        }
         var aux = new AuxViewsMenu(Config, Main.Library, Main.Recognition, textures, readback, log);
         Main.AuxMenu = aux;
         Library = new LibraryWindow(Config, pi, Main.Library, Main.Recognition, textures, readback, dragDrop, log,

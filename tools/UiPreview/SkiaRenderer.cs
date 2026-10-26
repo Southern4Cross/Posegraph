@@ -49,7 +49,11 @@ public sealed class SkiaRenderer
                 for (var k = 0; k < cmd.ElemCount; k += 3)
                 {
                     for (var j = 0; j < 3; j++) tri[j] = vtx.Data[idx.Data[cmd.IdxOffset + k + j] + cmd.VtxOffset];
-                    var solid = tri[0].Uv == tri[1].Uv && tri[1].Uv == tri[2].Uv;
+                    // 纹理坐标共线（面积为 0）时 Skia 求不出映射会跳过：纯色（三点相同）和整数粗细的抗锯齿线
+                    // （纹理坐标在图集的同一行上）都按顶点颜色画
+                    var a = tri[1].Uv - tri[0].Uv;
+                    var b = tri[2].Uv - tri[0].Uv;
+                    var solid = MathF.Abs(a.X * b.Y - a.Y * b.X) < 1e-9f;
                     foreach (var v in tri)
                     {
                         var p = new SKPoint(v.Pos.X - origin.X, v.Pos.Y - origin.Y);
