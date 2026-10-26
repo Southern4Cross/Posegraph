@@ -1,8 +1,11 @@
 # Python
 .venv/
+.venv-*/
 __pycache__/
 *.pyc
 *.egg-info/
+build/
+.pytest_cache/
 
 # Backend: upstream source, model weights, outputs
 backend/third_party/

@@ -42,15 +42,38 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     public Task ConfigureAsync(Configuration c) => PostAsync("/model/config",
         new Dictionary<string, object> { ["device"] = c.BackendDevice, ["release_after"] = c.ReleaseAfter, ["mhr_on_cpu"] = c.MhrOnCpu });
 
-    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name)
+    /// <summary>每批预识别开始前同步并行上限，设备和释放策略保持不变。</summary>
+    public async Task ConfigureRecognitionAsync(int parallelism)
+    {
+        var limit = Math.Clamp(parallelism, 1, 8);
+        using var resp = await _http.PostAsJsonAsync(Url("/model/config"), new { recognition_parallelism = limit }, Json);
+        var body = await ReadAsync<JsonElement>(resp);
+        var confirmed = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("model", out var model) &&
+            model.ValueKind == JsonValueKind.Object && model.TryGetProperty("config", out var config) &&
+            config.ValueKind == JsonValueKind.Object && config.TryGetProperty("recognitionParallelism", out var value) &&
+            value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var actual) && actual == limit;
+        // Older backends serialize inference and ignore this unknown config field.
+        // Accept that only for the default; never present HTTP fan-out as real parallel inference.
+        if (limit > 1 && !confirmed)
+            throw new InvalidOperationException(Loc.T("当前后端不支持并行识别，请更新并重启后端"));
+    }
+
+    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, CancellationToken ct = default)
     {
         using var content = new ByteArrayContent(image);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}"), content);
-        return (await ReadAsync<SessionInfo>(resp))!;
+        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}"), content, ct);
+        return (await ReadAsync<SessionInfo>(resp, ct))!;
     }
 
-    public Task<byte[]> SessionImageAsync(string sid) => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"));
+    public Task<byte[]> SessionImageAsync(string sid, CancellationToken ct = default)
+        => _http.GetByteArrayAsync(Url($"/sessions/{sid}/image"), ct);
+
+    public async Task DeleteSessionAsync(string sid, CancellationToken ct = default)
+    {
+        using var resp = await _http.DeleteAsync(Url($"/sessions/{sid}"), ct);
+        await ReadAsync<JsonElement>(resp, ct);
+    }
 
     public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race,
                                                     bool trustReference = false)
@@ -73,16 +96,16 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     }
 
     /// <summary>非 2xx 时把后端 FastAPI 的 detail 作为异常信息抛出。</summary>
-    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp)
+    private static async Task<T?> ReadAsync<T>(HttpResponseMessage resp, CancellationToken ct = default)
     {
         if (!resp.IsSuccessStatusCode)
         {
-            var text = await resp.Content.ReadAsStringAsync();
+            var text = await resp.Content.ReadAsStringAsync(ct);
             string detail = text;
             try { detail = JsonDocument.Parse(text).RootElement.GetProperty("detail").ToString(); } catch { }
             throw new InvalidOperationException(Loc.F("后端返回 {0}：{1}", (int)resp.StatusCode, detail));
         }
-        return await resp.Content.ReadFromJsonAsync<T>(Json);
+        return await resp.Content.ReadFromJsonAsync<T>(Json, ct);
     }
 
     public void Dispose() => _http.Dispose();

@@ -85,11 +85,32 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
 
 1. Enter GPose and select the actor (or pick one in the actor list, which shows players, actors created in Brio
    and humanoid NPCs such as retainers).
-2. Click the folder icon or drag an image onto the *Image* tab (jpg, png, webp, bmp, gif first frame, tiff, avif).
+2. Click the folder icon and choose **Choose images (multiple)** or **Choose folder (including subfolders)**.
+   You can also drop images or folders onto the *Image* tab (jpg, png, webp, bmp, gif first frame, tiff, avif).
 3. The first recognition loads the model (about 10–20 s); after that a recognition takes a few seconds.
+   For multiple images, Posegraph pre-recognizes the batch in the background. As each image finishes, click its successful
+   row in the left-hand list to load its preview and pose while the remaining images continue recognizing.
+   Only the image you select loads; its application follows the existing *Apply to actor right after recognition* setting.
+   A single image loads automatically.
 4. Check the overlay (*Image* tab: green = detected skeleton, orange = FFXIV skeleton) and the *3D* tab.
 5. Tune on the *Tuning* tab, read the *Hints* tab, then **Apply** (▶). Use the camera button to match the photo camera,
    ↶ to restore the pose from before the first apply, and the disk button to export a `.pose` file.
+
+Update the backend together with the plugin when importing more than eight images. The backend keeps up to eight recognized
+sessions in RAM and stores additional sessions in temporary disk files, so earlier results remain available for selection.
+Replacing the imported batch or unloading the plugin clears its cached sessions and temporary files.
+
+Multi-image recognition is sequential by default (**1**). In *Settings* → *Recognition backend* →
+**Multi-image recognition concurrency**, choose **1–8** from the dropdown; changes take effect with the next batch.
+Settings above **1** require an updated, restarted backend. If the running backend cannot confirm support, Posegraph
+reports an error and does not start the batch; the default **1** remains compatible with older backends.
+Parallel recognition uses isolated workers, each loading a complete model, so RAM and VRAM requirements grow with the
+worker count. The estimates to the right of the dropdown budget approximately **3 GB VRAM per GPU worker** (plus
+**0.75 GB** if MHR also runs on the GPU) and **4 GB RAM per worker**. CPU recognition has no inference VRAM budget;
+*Auto* shows the GPU plan and may fall back to CPU. Actual extra memory depends on the mode and images; estimates exclude
+the game, image and session caches, and residual GPU context. Multi-image/folder imports and three-way CPU recognition have
+been manually verified. Higher concurrency may not improve speed; GPU parallel throughput and peak resource use remain unmeasured. **Stop pre-recognition** lets in-flight images finish
+and skips images that have not started.
 
 Status bar icons, left to right: Brio, GPose, IVCS (shown once the game pose has been read), backend, VRAM, RAM;
 hover for details.
@@ -101,6 +122,7 @@ hover for details.
 | Language | Auto | Chinese if the game client is Chinese, otherwise the Dalamud UI language decides; English if neither is Chinese |
 | Device | Auto | GPU when ~3 GB VRAM is free, otherwise CPU. *GPU* forces the GPU, *CPU* never touches VRAM |
 | Unload model | Right after recognition | Frees VRAM/RAM for the game; the next recognition reloads the model (~5–10 s) |
+| Multi-image recognition concurrency | 1 | 1–8 complete model workers; takes effect next batch, using more RAM/VRAM |
 | Keep MHR on the CPU | On | Saves ~750 MB VRAM in GPU mode, ~0.5 s slower |
 | Apply when a slider is released | On | Turn off to apply manually |
 

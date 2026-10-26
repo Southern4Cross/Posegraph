@@ -18,7 +18,7 @@ namespace Posegraph.UI;
 /// 主界面：状态栏 → 选图识别 → 图像叠加 / 3D 火柴人 / 调整 / 提示 / 设置 → 应用、镜头、还原、导出。
 /// 识别只做一次（后端缓存），调参只重跑重定向；拖动滑杆时只刷新预览，松手才应用到角色（Brio 撤销历史保持干净）。
 /// </summary>
-public sealed class MainWindow : Window, IDisposable
+public sealed partial class MainWindow : Window, IDisposable
 {
     private static readonly Vector4 Green = new(0.35f, 0.85f, 0.4f, 1);
     private static readonly Vector4 Yellow = new(1f, 0.8f, 0.25f, 1);
@@ -68,9 +68,7 @@ public sealed class MainWindow : Window, IDisposable
 
     // 会话
     private SessionInfo? _session;
-    private string? _imagePath;
     private IDalamudTextureWrap? _texture;
-    private IDalamudTextureWrap? _newTexture;
     private int _person;
     private RetargetParams _params;
     private bool _paramsDirty;       // 参数可能变了：松手后与已保存的比较，不同就写入配置
@@ -153,10 +151,9 @@ public sealed class MainWindow : Window, IDisposable
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
-        _client.Dispose();
+        DisposeImages();   // drains outstanding image work before disposing the HTTP client
         _updater.Dispose();
         _texture?.Dispose();
-        _newTexture?.Dispose();
     }
 
     private void SetStatus(string text, Vector4? color = null)
@@ -499,45 +496,6 @@ public sealed class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ 识别与重定向
 
-    private void Recognize(string path)
-    {
-        if (_recognizing) return;
-        if (!BackendOnline)
-        {
-            SetError(Loc.T("后端离线：先点右上角电源按钮启动"));
-            return;
-        }
-        _recognizing = true;
-        _imagePath = path;
-        SetStatus(ModelReady ? Loc.T("识别中…") : Loc.T("加载模型并识别中（约 10~20 秒）…"), Yellow);
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var bytes = await File.ReadAllBytesAsync(path);
-                var info = await _client.CreateSessionAsync(bytes, Path.GetFileNameWithoutExtension(path));
-                var png = await _client.SessionImageAsync(info.SessionId);
-                var tex = await _textures.CreateFromImageAsync(png);
-                Interlocked.Exchange(ref _newTexture, tex)?.Dispose();
-                _session = info;
-                _person = 0;
-                _result = null;
-                _params.Offsets.Clear();   // 手动偏移只对当前图有意义
-                _selected = null;
-                SetStatus(Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f), Green);
-                RequestRetarget(_config.PushAfterRecognize);
-            }
-            catch (Exception ex)
-            {
-                SetError(Loc.F("识别失败：{0}", ex.Message));
-            }
-            finally
-            {
-                _recognizing = false;
-            }
-        });
-    }
-
     /// <summary>预设的值：有保存过的用保存的，否则用内置预设。</summary>
     private RetargetParams LoadParams(string preset)
     {
@@ -584,49 +542,58 @@ public sealed class MainWindow : Window, IDisposable
 
     private async Task RetargetLoop()
     {
+        CancellationToken activeToken = default;
         try
         {
             do
             {
+                if (_session is not { } session) break;
+                var ct = _imagePoseToken;
+                activeToken = ct;
                 _rtDirty = false;
                 var push = _rtPush;
                 _rtPush = false;
-                var session = _session!;
                 if (push && _resetPending)
                 {
                     _resetPending = false;
-                    await ClearBrioPoseAsync();
+                    await ClearBrioPoseAsync(ct);
                 }
                 var reference = await ReferenceAsync();
+                if (session != _session || ct.IsCancellationRequested) continue;
                 var trust = _referenceSignature is { } sig && _cleanSignatures.Contains(sig);
                 var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
                                                          _raceOverride ?? _detectedRace, trust);
-                if (session != _session) continue;
+                if (session != _session || ct.IsCancellationRequested) continue;
                 // 游戏骨长不对（换种族前残留的 Brio 姿势）：先清除再算一次；清除后仍不符就是 Customize+ / 改体型 MOD
-                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync())
+                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync(ct))
                 {
                     _rtPush = true;
                     _rtDirty = true;
                     continue;
                 }
                 _result = result;
-                if (push) await PushAsync(result.Pose);
+                if (push) await PushAsync(result.Pose, _actor, ct);
             } while (_rtDirty || _rtPush);
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            SetError(Loc.F("重定向失败：{0}", ex.Message));
+            if (!activeToken.IsCancellationRequested)
+                SetError(Loc.F("重定向失败：{0}", ex.Message));
         }
         finally
         {
             _rtBusy = false;
+            if ((_rtDirty || _rtPush) && _session is not null && !_imageLifetime.IsCancellationRequested)
+                RequestRetarget(false);
         }
     }
 
     /// <summary>清除 Brio 姿势栈后重新读取参考姿势；这个身份之后的骨长按游戏实际值计算。</summary>
-    private async Task<bool> ClearBrioPoseAsync()
+    private async Task<bool> ClearBrioPoseAsync(CancellationToken ct = default)
     {
-        if (!await _applier.ResetPoseAsync(_actor)) return false;
+        if (!await _applier.ResetPoseAsync(_actor, ct)) return false;
+        ct.ThrowIfCancellationRequested();
         _reference = null;
         if (await _applier.IdentifyAsync(_actor) is { } id)
         {
@@ -653,7 +620,9 @@ public sealed class MainWindow : Window, IDisposable
         return pose;
     }
 
-    private async Task PushAsync(string pose)
+    private Task PushAsync(string pose) => PushAsync(pose, _actor);
+
+    private async Task PushAsync(string pose, int? actor, CancellationToken ct = default)
     {
         if (!_clientState.IsGPosing)
         {
@@ -662,10 +631,16 @@ public sealed class MainWindow : Window, IDisposable
         }
         var status = _pushStatus ?? Loc.T("已应用到角色");
         _pushStatus = null;
-        var error = await _applier.ApplyAsync(_actor, pose);
+        string? error;
+        try
+        {
+            error = await _applier.ApplyAsync(actor, pose, ct);
+            ct.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         if (error is null)
         {
-            _pushedIndex = (await _applier.IdentifyAsync(_actor))?.Index;
+            _pushedIndex = (await _applier.IdentifyAsync(actor))?.Index;
             SetStatus(status, Green);
         }
         else SetError(error);
@@ -673,8 +648,13 @@ public sealed class MainWindow : Window, IDisposable
 
     private void ApplyNow()
     {
-        // 结果是按残留姿势算的、或刚换过种族：重新计算（会先清除 Brio 残留姿势）
-        if (_result is { ReferenceStale: false } r && !_resetPending) _ = Run(() => PushAsync(r.Pose));
+        // Recalculate stale references before applying. A switched image cancels both apply passes.
+        if (_result is { ReferenceStale: false } r && !_resetPending)
+        {
+            var ct = _imagePoseToken;
+            var actor = _actor;
+            _ = Run(() => PushAsync(r.Pose, actor, ct));
+        }
         else RequestRetarget(true);
     }
 
@@ -735,19 +715,15 @@ public sealed class MainWindow : Window, IDisposable
             if (!ok || paths.Count == 0) return;
             _config.LastImageDir = Path.GetDirectoryName(paths[0]) ?? "";
             _pi.SavePluginConfig(_config);
-            Recognize(paths[0]);
-        }, 1, dir, true);
+            ImportImagePaths(paths);
+        }, 0, dir, true);
     }
 
     // ------------------------------------------------------------------ 绘制
 
     public override void Draw()
     {
-        if (Interlocked.Exchange(ref _newTexture, null) is { } tex)
-        {
-            _texture?.Dispose();
-            _texture = tex;
-        }
+        PollImages();
         PollHealth();
         RefreshActors();
         PersistParams();
@@ -782,12 +758,12 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawToolbar()
     {
-        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（jpg/png/webp/bmp/gif/tiff/avif），也可以把图片拖到图像页"),
-                       !_recognizing))
-            OpenImageDialog();
+        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（支持多选）或文件夹，也可以拖到图像页"), !ImageImportBusy))
+            ImGui.OpenPopup("##imageImport");
+        DrawImageImportMenu();
         ImGui.SameLine();
-        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _imagePath is not null && !_recognizing))
-            Recognize(_imagePath!);
+        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _selectedImage is not null && !ImageImportBusy))
+            RecognizeImageAgain(_selectedImage!);
         ImGui.SameLine();
 
         // 角色
@@ -898,7 +874,7 @@ public sealed class MainWindow : Window, IDisposable
     private void DrawFooter()
     {
         var hasResult = _result is not null;
-        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing))
+        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing && _imageLoadTask is null && !_rtBusy))
             ApplyNow();
         ImGui.SameLine();
         if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing))
@@ -926,10 +902,30 @@ public sealed class MainWindow : Window, IDisposable
 
     private void DrawImageTab()
     {
+        if (_images.Count <= 1)
+        {
+            DrawImagePreview();
+            return;
+        }
+        var avail = ImGui.GetContentRegionAvail();
+        var width = Math.Min(190 * ImGuiHelpers.GlobalScale, avail.X * 0.42f);
+        using (var list = ImRaii.Child("##imageList", new Vector2(width, 0), true))
+            if (list) DrawImageList();
+        ImGui.SameLine();
+        using (var preview = ImRaii.Child("##imagePreview", new Vector2(0, 0)))
+            if (preview) DrawImagePreview();
+    }
+
+    private void DrawImagePreview()
+    {
         var showMhr = _config.ShowMhrOverlay;
         var showFf = _config.ShowFfxivOverlay;
+        var overlayRowWidth = ImGui.CalcTextSize(Loc.T("识别骨架（绿）")).X
+            + ImGui.CalcTextSize(Loc.T("FF14 骨架（橙）")).X
+            + ImGui.GetFrameHeight() * 2 + ImGui.GetStyle().ItemSpacing.X * 3;
+        var sameRow = ImGui.GetContentRegionAvail().X >= overlayRowWidth;
         var toggled = ImGui.Checkbox(Loc.T("识别骨架（绿）"), ref showMhr);
-        ImGui.SameLine();
+        if (sameRow) ImGui.SameLine();
         toggled |= ImGui.Checkbox(Loc.T("FF14 骨架（橙）"), ref showFf);
         if (toggled)
         {
@@ -941,13 +937,18 @@ public sealed class MainWindow : Window, IDisposable
         var avail = ImGui.GetContentRegionAvail();
         if (_texture is null || _session is null)
         {
-            ImGui.Button(_recognizing ? Loc.T("识别中…") : Loc.T("点左上角文件夹选图\n或把图片拖到这里"), new Vector2(avail.X, Math.Max(80, avail.Y)));
+            var message = _imageLoadTask is not null ? Loc.T("加载所选图片中…")
+                : _recognizing && _images.Any(i => i.Session is not null) ? Loc.T("从左侧选择已识别的图片以预览和应用")
+                : _recognizing ? Loc.T("正在预识别全部图片…")
+                : _images.Count > 1 ? Loc.T("从左侧列表选择图片以加载预览")
+                : Loc.T("点左上角文件夹选图\n或把图片拖到这里");
+            ImGui.Button(message, new Vector2(avail.X, Math.Max(80, avail.Y)));
             DropTarget();
             return;
         }
         var imgW = _session.ImageSize[0];
         var imgH = _session.ImageSize[1];
-        var scale = Math.Min(avail.X / imgW, avail.Y / imgH);
+        var scale = Math.Min(Math.Max(1, avail.X) / imgW, Math.Max(1, avail.Y) / imgH);
         var size = new Vector2(imgW, imgH) * scale;
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail.X - size.X) / 2);
         var origin = ImGui.GetCursorScreenPos();
@@ -980,7 +981,7 @@ public sealed class MainWindow : Window, IDisposable
     private const string DragLabel = "PosegraphImage";
 
     private static bool IsImage(string path)
-        => Path.GetExtension(path) is { Length: > 1 } ext && ImageExtensions.Contains(ext.ToLowerInvariant());
+        => ImageFiles.IsImage(path);
 
     /// <summary>
     /// 外部文件拖放分两步：每帧用 CreateImGuiSource 把系统拖动转成 ImGui 拖放负载，再由目标区域用 CreateImGuiTarget 接收。
@@ -988,21 +989,19 @@ public sealed class MainWindow : Window, IDisposable
     /// </summary>
     private void DragSource()
     {
-        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImage), m =>
+        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImageInput), m =>
         {
-            ImGui.TextUnformatted(Loc.F("松开以识别：{0}", Path.GetFileName(m.Files.First(IsImage))));
+            ImGui.TextUnformatted(Loc.F("松开以导入 {0} 个文件或文件夹", m.Files.Count(IsImageInput)));
             return true;
         });
-        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImage))
+        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImageInput))
             _selectTab = 0;
     }
 
     private void DropTarget()
     {
         if (!_dragDrop.CreateImGuiTarget(DragLabel, out var files, out _)) return;
-        var file = files.FirstOrDefault(IsImage);
-        if (file is null) SetError(Loc.T("不支持的文件格式"));
-        else Recognize(file);
+        ImportImagePaths(files);
     }
 
     // ---------------- 3D 火柴人
@@ -1550,6 +1549,7 @@ public sealed class MainWindow : Window, IDisposable
         ItemTip(Loc.T("释放后显存/内存归还给游戏，下次识别重新加载（约 5~10 秒）。\nGPU 模式用过一次后，CUDA 运行时会常驻少量显存，直到后端退出"));
         using (ImRaii.Disabled(_config.BackendDevice == "cpu"))
             changed |= Check(Loc.T("GPU 模式下 MHR 放 CPU"), _config.MhrOnCpu, v => _config.MhrOnCpu = v, Loc.T("显存约省 750MB，结果一致，每张约慢 0.5 秒"));
+        changed |= DrawRecognitionConcurrencySettings();
         return changed;
     }
 
