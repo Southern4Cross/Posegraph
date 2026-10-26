@@ -540,7 +540,8 @@ public sealed class MainWindow : Window, IDisposable
     }
 
     /// <summary>force：忽略缓存重新识别（「重新识别」按钮）。</summary>
-    private void Recognize(string path, bool force = false)
+    /// <summary>note：识别完成时附在状态后面的提示。</summary>
+    private void Recognize(string path, bool force = false, string? note = null)
     {
         if (_recognizing) return;
         if (!BackendOnline)
@@ -575,7 +576,8 @@ public sealed class MainWindow : Window, IDisposable
                 SetStatus((info.Device is null
                               ? Loc.T("已从识别缓存读取")
                               : Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f))
-                          + (fix is not null ? Loc.T("，已恢复保存的修正") : ""), Green);
+                          + (fix is not null ? Loc.T("，已恢复保存的修正") : "")
+                          + (InLibrary ? "" : Loc.T("；未存入图库（工具栏的文件夹 + 按钮可存入）")) + (note ?? ""), Green);
                 RequestRetarget(_config.PushAfterRecognize);
             }
             catch (Exception ex)
@@ -835,19 +837,56 @@ public sealed class MainWindow : Window, IDisposable
     }
 
     /// <summary>拖到主窗口的图片 / 文件夹：复制进图库当前文件夹，打开第一张，其余加入批量识别。</summary>
-    private void ImportDropped(IReadOnlyCollection<string> paths)
+    private void OpenDropped(IReadOnlyCollection<string> files, IReadOnlyCollection<string> dirs)
     {
+        var images = files.Where(ImageLibrary.IsImage).ToList();
+        if (images.Count == 0)
+        {
+            SetError(dirs.Count > 0 ? Loc.T("文件夹请拖到图库窗口里导入") : Loc.T("不支持的文件格式"));
+            return;
+        }
+        Recognize(images[0], note: images.Count > 1 || dirs.Count > 0 ? Loc.T("；只打开了第一张，多张图片或文件夹请拖到图库窗口") : null);
+    }
+
+    /// <summary>当前图片在图库（自带图库或某个来源）里。</summary>
+    private bool InLibrary => _imagePath is { } p && Library.SourceRootOf(p, _config.LibrarySources) is not null;
+
+    /// <summary>用户在 3D / 调整页改过：有手动偏移，或参数与预设保存值不同。</summary>
+    private bool HasUserCorrection()
+        => _params.Offsets.Any(kv => kv.Value.Any(v => v != 0)) || ParamsSnapshot(_params) != ParamsSnapshot(LoadParams(_preset));
+
+    /// <summary>图库内容变了（存入了新图），由 Plugin 接到图库窗口的刷新。</summary>
+    public Action? LibraryChanged { get; set; }
+
+    /// <summary>
+    /// 把当前图片存进图库当前文件夹（按内容查重，已有就不再复制），同时把 3D / 调整页的修正存进它的识别缓存，
+    /// 下次从图库打开自动恢复。
+    /// </summary>
+    private void SaveCurrentToLibrary()
+    {
+        if (_imagePath is not { } image || _imageSha1 is not { } sha1) return;
         var folder = Directory.Exists(_config.LibraryFolder) ? _config.LibraryFolder : Library.Root;
+        var root = Library.SourceRootOf(folder, _config.LibrarySources) ?? Library.Root;
+        var correction = HasUserCorrection() ? new SavedCorrection(_preset, _params.Clone(), DateTime.Now) : null;
         _ = Run(async () =>
         {
-            var copied = await Task.Run(() => Library.Import(paths, folder, out _));
-            if (copied.Count == 0)
+            var r = await Task.Run(() => Library.Import([image], folder, root));
+            var saved = r.Added.FirstOrDefault() ?? r.Duplicates.Select(d => d.Existing).FirstOrDefault();
+            if (saved is null)
             {
-                SetError(Loc.T("不支持的文件格式"));
+                SetError(Loc.T("存入图库失败"));
                 return;
             }
-            Recognize(copied[0]);
-            if (copied.Count > 1) Recognition.Enqueue(copied.Skip(1));
+            if (correction is not null)
+            {
+                Library.WriteCorrection(sha1, correction);
+                _correctionLoaded = true;
+            }
+            if (_imagePath == image) _imagePath = saved;
+            var rel = Path.GetRelativePath(root, saved);
+            var fix = correction is not null ? Loc.T("（含 3D 修正）") : "";
+            SetStatus(r.Added.Count > 0 ? Loc.F("已存入图库：{0}{1}", rel, fix) : Loc.F("图库里已有这张图：{0}{1}", rel, fix), Green);
+            LibraryChanged?.Invoke();
         });
     }
 
@@ -899,6 +938,13 @@ public sealed class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片（不用识别缓存）"), _imagePath is not null && !_recognizing))
             Recognize(_imagePath!, true);
+        ImGui.SameLine();
+        var canSave = _session is not null && _imageSha1 is not null && !InLibrary && !_recognizing;
+        using (ImRaii.PushColor(ImGuiCol.Text, Yellow, canSave))
+            if (IconButton("##saveLib", FontAwesomeIcon.FolderPlus,
+                           InLibrary ? Loc.T("这张图已在图库里（修正在 3D 页保存）")
+                                     : Loc.T("存入图库：复制到图库当前文件夹（按内容查重），并带上 3D / 调整页的修正"), canSave))
+                SaveCurrentToLibrary();
         ImGui.SameLine();
 
         // 角色
@@ -1116,7 +1162,7 @@ public sealed class MainWindow : Window, IDisposable
     private void DropTarget()
     {
         if (_dragDrop.CreateImGuiTarget(DragLabel, out var files, out var dirs))
-            ImportDropped([.. files, .. dirs]);
+            OpenDropped(files, dirs);
     }
 
     // ---------------- 3D 火柴人
