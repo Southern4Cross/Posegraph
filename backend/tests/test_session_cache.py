@@ -27,6 +27,8 @@ def make_session(sid, marker=1):
         "rest_joint_coords": None,
         "bbox": np.array([0, 0, 12, 16], dtype=np.int32),
         "numpy_scalar": np.float32(1.25),
+        "annotations": {"labels": ["portrait", "cached"]},
+        "scores": [0.5, 0.75],
     }], 123.5)
 
 
@@ -178,6 +180,29 @@ class BatchSessionApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 np.testing.assert_array_equal(run.call_args.args[0]["joint_coords"], np.ones((4, 3)))
             self.assertEqual(len(calls), 12)
+        def archive_and_restore(sid):
+            archive = self.client.get(f"/sessions/{sid}/archive")
+            self.assertEqual(archive.status_code, 200, archive.text)
+            restored = self.client.post("/sessions/archive", params={"name": "restored-" + sid}, content=archive.content)
+            self.assertEqual(restored.status_code, 200, restored.text)
+            info = restored.json()
+            self.assertIsNone(info["device"])
+            self.assertEqual(info["name"], "restored-" + sid)
+            restored_id = info["sessionId"]
+            self.assertNotEqual(restored_id, sid)
+            np.testing.assert_array_equal(service._session(restored_id).humans[0]["joint_coords"],
+                                          service._session(sid).humans[0]["joint_coords"])
+            self.assertEqual(self.client.get(f"/sessions/{restored_id}/image").content,
+                             self.client.get(f"/sessions/{sid}/image").content)
+            self.assertEqual(self.client.delete(f"/sessions/{restored_id}").json(), {"ok": True})
+        with patch.object(service, "_recognition_parallelism", 8), patch.object(service, "_parallel_pool", None), \
+                patch.object(service, "_estimate", side_effect=AssertionError("archive restoration must not infer")):
+            # 12 source sessions plus simultaneous restored sessions exceed the
+            # eight RAM slots: none may vanish between create and GET archive.
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(archive_and_restore, ids))
+            self.assertFalse(service._model_info()["loaded"])
+        self.assertEqual(len(calls), 12)
         for sid in ids:
             response = self.client.delete(f"/sessions/{sid}")
             self.assertEqual(response.status_code, 200, response.text)

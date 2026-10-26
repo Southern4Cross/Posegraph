@@ -11,6 +11,7 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Posegraph.Backend;
+using Posegraph.Library;
 
 namespace Posegraph.UI;
 
@@ -27,7 +28,6 @@ public sealed partial class MainWindow : Window, IDisposable
     private static readonly Vector4 Orange = new(1f, 0.55f, 0f, 1);
     private static readonly Vector4 MhrGreen = new(0.31f, 0.86f, 0.31f, 1);
 
-    private const string ImageExtensions = "{.jpg,.jpeg,.png,.webp,.bmp,.gif,.tif,.tiff,.avif}";
 
     // 静态表里的界面文字存中文原文，使用时再 Loc.T 翻译（运行时可切换语言）
 
@@ -50,6 +50,12 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly BridgeServer _server;
     private readonly BackendClient _client;
     private readonly BackendProcess _process;
+    private readonly ITextureReadbackProvider _readback;
+    public ImageLibrary Library { get; }
+    public RecognitionService Recognition { get; }
+
+    /// <summary>打开 / 关闭图库窗口（由 Plugin 接上）。</summary>
+    public Action? ToggleLibrary { get; set; }
     private readonly SystemProbe _probe = new();
     private readonly BackendUpdater _updater = new();
 
@@ -68,7 +74,11 @@ public sealed partial class MainWindow : Window, IDisposable
 
     // 会话
     private SessionInfo? _session;
+    private string? _imagePath;
+    private string? _imageSha1;      // 当前图的内容哈希：会话丢了（后端重启）时据此从识别缓存恢复
+    private bool _correctionLoaded;  // 当前参数来自这张图保存的修正（不写回预设）
     private IDalamudTextureWrap? _texture;
+    private IDalamudTextureWrap? _newTexture;
     private int _person;
     private RetargetParams _params;
     private bool _paramsDirty;       // 参数可能变了：松手后与已保存的比较，不同就写入配置
@@ -96,6 +106,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private bool _resetPending;                                     // 换了种族：下次应用前先清除 Brio 残留姿势
     private readonly HashSet<string> _cleanSignatures = new();      // 已清除过 Brio 姿势的身份：骨长不符也信游戏值
     private string? _actorKey;                                      // 上面这些状态属于哪个角色（ActorIdentity.Key）
+    private bool? _actorIvcs;                                       // 当前角色是否加载了 IVCS 骨骼，没读到游戏姿势时为 null
     private readonly Dictionary<string, ActorState> _actorStates = new();   // 本次 GPose 里切换过的角色各自的状态
 
     /// <summary>切走时记下的角色状态，切回来时恢复。Race：上次看到的骨架编号，切回来时不同说明在别处换过种族。</summary>
@@ -111,18 +122,22 @@ public sealed partial class MainWindow : Window, IDisposable
     private int? _selectTab;
 
     public MainWindow(Configuration config, IDalamudPluginInterface pi, IClientState clientState, ITextureProvider textures,
-                      IDragDropManager dragDrop, BrioBridge brio, PoseApplier applier, BridgeServer server)
+                      ITextureReadbackProvider readback, IDragDropManager dragDrop, BrioBridge brio, PoseApplier applier,
+                      BridgeServer server)
         : base("Posegraph###PosegraphMain")
     {
         _config = config;
         _pi = pi;
         _clientState = clientState;
         _textures = textures;
+        _readback = readback;
         _dragDrop = dragDrop;
         _brio = brio;
         _applier = applier;
         _server = server;
         _client = new BackendClient(() => _config.BackendPort);
+        Library = new ImageLibrary(pi.GetPluginConfigDirectory());
+        Recognition = new RecognitionService(Library, _client, () => _config.BatchRecognitionParallelism);
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
         _params = LoadParams(_preset);
@@ -151,9 +166,12 @@ public sealed partial class MainWindow : Window, IDisposable
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
-        DisposeImages();   // drains outstanding image work before disposing the HTTP client
+        Recognition.Dispose();
+        Library.Save();
+        _ = Recognition.Completion.ContinueWith(t => { _ = t.Exception; _client.Dispose(); }, TaskScheduler.Default);
         _updater.Dispose();
         _texture?.Dispose();
+        _newTexture?.Dispose();
     }
 
     private void SetStatus(string text, Vector4? color = null)
@@ -166,7 +184,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ 状态
 
-    private bool BackendOnline => _health is not null;
+    public bool BackendOnline => _health is not null;
 
     private bool ModelReady => _health?.Model.Loaded == true;
 
@@ -271,11 +289,27 @@ public sealed partial class MainWindow : Window, IDisposable
         _referenceSignature = null;
         _pendingSignature = null;
         _currentSignature = id.Signature;
+        CheckIvcs(id.Key);
         if (_session is null) return;
         if (raceChanged) SetStatus(Loc.F("检测到角色种族变化（{0}），已重新计算", Races.Label(id.Race)), Yellow);
         else if (switched) SetStatus(Loc.F("已切换到 {0}，已重新计算", ActorName(id.Index)));
         RequestRetarget(false);
     }
+
+    /// <summary>读一次角色的游戏姿势，判断是否加载了 IVCS 骨骼（不用等识别图片，选中角色就能在状态栏看到）。</summary>
+    private void CheckIvcs(string key)
+    {
+        _actorIvcs = null;
+        _ = Run(async () =>
+        {
+            if ((await _applier.IdentifyAsync(_actor))?.Key != key) return;
+            var pose = await _applier.GetPoseAsync(_actor);
+            if (pose is not null && _actorKey == key) _actorIvcs = HasIvcs(pose);
+        });
+    }
+
+    /// <summary>Brio 读回的姿势含骨架里的全部骨骼，有 iv_ 骨骼就是装了 IVCS（与后端的判断一致）。</summary>
+    private static bool HasIvcs(string pose) => pose.Contains("\"iv_", StringComparison.Ordinal);
 
     private void SaveActorState()
     {
@@ -296,6 +330,7 @@ public sealed partial class MainWindow : Window, IDisposable
         _currentSignature = null;
         _pushedIndex = null;
         _resetPending = false;
+        _actorIvcs = null;
     }
 
     private string ActorName(int index) => _actors.FirstOrDefault(a => a.Index == index).Name ?? $"#{index}";
@@ -331,8 +366,8 @@ public sealed partial class MainWindow : Window, IDisposable
         StatusIcon(FontAwesomeIcon.Camera, _clientState.IsGPosing ? Green : Grey,
                    _clientState.IsGPosing ? Loc.T("GPose：已进入") : Loc.T("GPose：未进入（只能预览和导出，不能应用到角色）"));
 
-        // IVCS（按最近一次计算时读到的游戏姿势判断）
-        if (_clientState.IsGPosing && _result?.Ivcs is { } ivcs)
+        // IVCS（选中角色时读一次游戏姿势判断，之后每次读参考姿势时更新）
+        if (_clientState.IsGPosing && _actorIvcs is { } ivcs)
             StatusIcon(FontAwesomeIcon.HandPaper, ivcs ? Green : Yellow,
                        ivcs ? Loc.T("IVCS：已加载") : Loc.T("IVCS：未检测到（手指第三节的弯曲已合并到第二节；装上 IVCS 手指会更准）"));
 
@@ -496,6 +531,64 @@ public sealed partial class MainWindow : Window, IDisposable
 
     // ------------------------------------------------------------------ 识别与重定向
 
+    /// <summary>图库双击 / 拖入主窗口：打开一张图（识别过的从缓存恢复，不重跑模型）。</summary>
+    public void OpenImage(string path)
+    {
+        IsOpen = true;
+        _selectTab = 0;
+        Recognize(path);
+    }
+
+    /// <summary>force：忽略缓存重新识别（「重新识别」按钮）。</summary>
+    private void Recognize(string path, bool force = false)
+    {
+        if (_recognizing) return;
+        if (!BackendOnline)
+        {
+            SetError(Loc.T("后端离线：先点右上角电源按钮启动"));
+            return;
+        }
+        _recognizing = true;
+        _imagePath = path;
+        var cached = !force && Library.KnownHash(path) is { } known && Library.HasCache(known);
+        SetStatus(cached ? Loc.T("读取识别缓存…") : ModelReady ? Loc.T("识别中…") : Loc.T("加载模型并识别中（约 10~20 秒）…"), Yellow);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var old = _session;
+                var (info, sha1) = await Recognition.OpenAsync(path, force);
+                var png = await _client.SessionImageAsync(info.SessionId);
+                var tex = await _textures.CreateFromImageAsync(png);
+                Interlocked.Exchange(ref _newTexture, tex)?.Dispose();
+                _session = info;
+                _imageSha1 = sha1;
+                _person = 0;
+                _result = null;
+                // 这张图在 3D 页保存过修正就恢复；否则用预设（手动偏移只对当前图有意义，不带过来）
+                var fix = Library.ReadCorrection(sha1);
+                if (fix is not null) _preset = fix.Preset;
+                _params = fix?.Params.Clone() ?? LoadParams(_preset);
+                _correctionLoaded = fix is not null;
+                _selected = null;
+                if (old is not null) _ = _client.DeleteSessionAsync(old.SessionId).ContinueWith(_ => { });
+                SetStatus((info.Device is null
+                              ? Loc.T("已从识别缓存读取")
+                              : Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f))
+                          + (fix is not null ? Loc.T("，已恢复保存的修正") : ""), Green);
+                RequestRetarget(_config.PushAfterRecognize);
+            }
+            catch (Exception ex)
+            {
+                SetError(Loc.F("识别失败：{0}", ex.Message));
+            }
+            finally
+            {
+                _recognizing = false;
+            }
+        });
+    }
+
     /// <summary>预设的值：有保存过的用保存的，否则用内置预设。</summary>
     private RetargetParams LoadParams(string preset)
     {
@@ -512,11 +605,12 @@ public sealed partial class MainWindow : Window, IDisposable
         return System.Text.Json.JsonSerializer.Serialize(c);
     }
 
-    /// <summary>调整过的值按预设保存。拖动滑杆时不写，松手后再写。</summary>
+    /// <summary>调整过的值按预设保存。拖动滑杆时不写，松手后再写。用的是图片自己保存的修正时不写（那是这张图专用的）。</summary>
     private void PersistParams()
     {
         if (!_paramsDirty || ImGui.IsAnyItemActive()) return;
         _paramsDirty = false;
+        if (_correctionLoaded) return;
         var snapshot = ParamsSnapshot(_params);
         if (snapshot == _savedParams) return;
         var saved = _params.Clone();
@@ -542,58 +636,68 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private async Task RetargetLoop()
     {
-        CancellationToken activeToken = default;
+        var restored = false;
         try
         {
             do
             {
-                if (_session is not { } session) break;
-                var ct = _imagePoseToken;
-                activeToken = ct;
                 _rtDirty = false;
                 var push = _rtPush;
                 _rtPush = false;
+                var session = _session!;
                 if (push && _resetPending)
                 {
                     _resetPending = false;
-                    await ClearBrioPoseAsync(ct);
+                    await ClearBrioPoseAsync();
                 }
                 var reference = await ReferenceAsync();
-                if (session != _session || ct.IsCancellationRequested) continue;
                 var trust = _referenceSignature is { } sig && _cleanSignatures.Contains(sig);
-                var result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
+                RetargetResult? result = null;
+                try
+                {
+                    result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
                                                          _raceOverride ?? _detectedRace, trust);
-                if (session != _session || ct.IsCancellationRequested) continue;
+                }
+                catch (BackendException ex) when (ex.StatusCode == 404 && !restored && _imageSha1 is not null)
+                {
+                }
+                if (result is null)
+                {
+                    // 会话没了（后端重启过，或被批量识别挤出）：从识别缓存恢复后再算
+                    restored = true;
+                    if (await Recognition.RestoreAsync(_imageSha1!, session.Name) is not { } info)
+                        throw new InvalidOperationException(Loc.T("会话已失效且没有识别缓存，请重新识别"));
+                    if (session == _session) _session = info;
+                    _rtPush |= push;
+                    _rtDirty = true;
+                    continue;
+                }
+                if (session != _session) continue;
                 // 游戏骨长不对（换种族前残留的 Brio 姿势）：先清除再算一次；清除后仍不符就是 Customize+ / 改体型 MOD
-                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync(ct))
+                if (push && result.ReferenceStale && !trust && await ClearBrioPoseAsync())
                 {
                     _rtPush = true;
                     _rtDirty = true;
                     continue;
                 }
                 _result = result;
-                if (push) await PushAsync(result.Pose, _actor, ct);
+                if (push) await PushAsync(result.Pose);
             } while (_rtDirty || _rtPush);
         }
-        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            if (!activeToken.IsCancellationRequested)
-                SetError(Loc.F("重定向失败：{0}", ex.Message));
+            SetError(Loc.F("重定向失败：{0}", ex.Message));
         }
         finally
         {
             _rtBusy = false;
-            if ((_rtDirty || _rtPush) && _session is not null && !_imageLifetime.IsCancellationRequested)
-                RequestRetarget(false);
         }
     }
 
     /// <summary>清除 Brio 姿势栈后重新读取参考姿势；这个身份之后的骨长按游戏实际值计算。</summary>
-    private async Task<bool> ClearBrioPoseAsync(CancellationToken ct = default)
+    private async Task<bool> ClearBrioPoseAsync()
     {
-        if (!await _applier.ResetPoseAsync(_actor, ct)) return false;
-        ct.ThrowIfCancellationRequested();
+        if (!await _applier.ResetPoseAsync(_actor)) return false;
         _reference = null;
         if (await _applier.IdentifyAsync(_actor) is { } id)
         {
@@ -616,13 +720,12 @@ public sealed partial class MainWindow : Window, IDisposable
         if (pose is null) return null;
         _reference = pose;
         _referenceSignature = id.Signature;
+        if (id.Key == _actorKey) _actorIvcs = HasIvcs(pose);   // 换了外貌（种族）后 IVCS 可能不同，跟着更新
         _backups.TryAdd(id.Signature, pose);
         return pose;
     }
 
-    private Task PushAsync(string pose) => PushAsync(pose, _actor);
-
-    private async Task PushAsync(string pose, int? actor, CancellationToken ct = default)
+    private async Task PushAsync(string pose)
     {
         if (!_clientState.IsGPosing)
         {
@@ -631,16 +734,10 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         var status = _pushStatus ?? Loc.T("已应用到角色");
         _pushStatus = null;
-        string? error;
-        try
-        {
-            error = await _applier.ApplyAsync(actor, pose, ct);
-            ct.ThrowIfCancellationRequested();
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        var error = await _applier.ApplyAsync(_actor, pose);
         if (error is null)
         {
-            _pushedIndex = (await _applier.IdentifyAsync(actor))?.Index;
+            _pushedIndex = (await _applier.IdentifyAsync(_actor))?.Index;
             SetStatus(status, Green);
         }
         else SetError(error);
@@ -648,13 +745,8 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void ApplyNow()
     {
-        // Recalculate stale references before applying. A switched image cancels both apply passes.
-        if (_result is { ReferenceStale: false } r && !_resetPending)
-        {
-            var ct = _imagePoseToken;
-            var actor = _actor;
-            _ = Run(() => PushAsync(r.Pose, actor, ct));
-        }
+        // 结果是按残留姿势算的、或刚换过种族：重新计算（会先清除 Brio 残留姿势）
+        if (_result is { ReferenceStale: false } r && !_resetPending) _ = Run(() => PushAsync(r.Pose));
         else RequestRetarget(true);
     }
 
@@ -707,23 +799,67 @@ public sealed partial class MainWindow : Window, IDisposable
         }, dir, true);
     }
 
-    private void OpenImageDialog()
+    /// <summary>当前结果存到 Brio 姿势库（骨长按游戏里的角色，和应用到角色的一样）。</summary>
+    private void SaveCurrentToBrio()
     {
-        var dir = Directory.Exists(_config.LastImageDir) ? _config.LastImageDir : null;
-        _fileDialog.OpenFileDialog(Loc.T("选择图片"), Loc.T("图片") + ImageExtensions, (ok, paths) =>
+        if (_result is not { } r || _imagePath is not { } image) return;
+        _ = Run(async () =>
         {
-            if (!ok || paths.Count == 0) return;
-            _config.LastImageDir = Path.GetDirectoryName(paths[0]) ?? "";
-            _pi.SavePluginConfig(_config);
-            ImportImagePaths(paths);
-        }, 0, dir, true);
+            var preview = await TextureImages.ThumbnailPngAsync(_textures, _readback, await File.ReadAllBytesAsync(image), 256);
+            var path = BrioPoseLibrary.Save(r.Pose, Path.GetFileNameWithoutExtension(image), Library.Meta(image)?.Tags ?? [],
+                                            preview, Path.GetFileName(image));
+            SetStatus(Loc.F("已存到 Brio 姿势库：{0}", Path.GetFileName(path)), Green);
+        });
+    }
+
+    /// <summary>
+    /// 图库里批量存到 Brio 姿势库：用当前的调整参数（不含手动偏移）和种族计算，不读游戏姿势（骨长用标准骨长）。
+    /// 没识别过的先识别。返回保存的路径。
+    /// </summary>
+    public async Task<string> SaveToBrioAsync(string image)
+    {
+        var (info, _) = await Recognition.OpenAsync(image);
+        try
+        {
+            var p = _params.Clone();
+            p.Offsets.Clear();
+            var r = await _client.RetargetAsync(info.SessionId, 0, p, null, _raceOverride ?? _detectedRace);
+            var preview = await TextureImages.ThumbnailPngAsync(_textures, _readback, await File.ReadAllBytesAsync(image), 256);
+            return BrioPoseLibrary.Save(r.Pose, Path.GetFileNameWithoutExtension(image), Library.Meta(image)?.Tags ?? [],
+                                        preview, Path.GetFileName(image));
+        }
+        finally
+        {
+            await _client.DeleteSessionAsync(info.SessionId);
+        }
+    }
+
+    /// <summary>拖到主窗口的图片 / 文件夹：复制进图库当前文件夹，打开第一张，其余加入批量识别。</summary>
+    private void ImportDropped(IReadOnlyCollection<string> paths)
+    {
+        var folder = Directory.Exists(_config.LibraryFolder) ? _config.LibraryFolder : Library.Root;
+        _ = Run(async () =>
+        {
+            var copied = await Task.Run(() => Library.Import(paths, folder, out _));
+            if (copied.Count == 0)
+            {
+                SetError(Loc.T("不支持的文件格式"));
+                return;
+            }
+            Recognize(copied[0]);
+            if (copied.Count > 1) Recognition.Enqueue(copied.Skip(1));
+        });
     }
 
     // ------------------------------------------------------------------ 绘制
 
     public override void Draw()
     {
-        PollImages();
+        if (Interlocked.Exchange(ref _newTexture, null) is { } tex)
+        {
+            _texture?.Dispose();
+            _texture = tex;
+        }
         PollHealth();
         RefreshActors();
         PersistParams();
@@ -758,12 +894,11 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void DrawToolbar()
     {
-        if (IconButton("##open", FontAwesomeIcon.FolderOpen, Loc.T("选择图片（支持多选）或文件夹，也可以拖到图像页"), !ImageImportBusy))
-            ImGui.OpenPopup("##imageImport");
-        DrawImageImportMenu();
+        if (IconButton("##open", FontAwesomeIcon.Images, Loc.T("图库：导入、分类、批量识别（双击图片打开到这里），也可以把图片拖到图像页")))
+            ToggleLibrary?.Invoke();
         ImGui.SameLine();
-        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片"), _selectedImage is not null && !ImageImportBusy))
-            RecognizeImageAgain(_selectedImage!);
+        if (IconButton("##again", FontAwesomeIcon.Redo, Loc.T("重新识别当前图片（不用识别缓存）"), _imagePath is not null && !_recognizing))
+            Recognize(_imagePath!, true);
         ImGui.SameLine();
 
         // 角色
@@ -874,7 +1009,7 @@ public sealed partial class MainWindow : Window, IDisposable
     private void DrawFooter()
     {
         var hasResult = _result is not null;
-        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing && _imageLoadTask is null && !_rtBusy))
+        if (IconButton("##apply", FontAwesomeIcon.Play, Loc.T("应用到角色"), hasResult && _clientState.IsGPosing))
             ApplyNow();
         ImGui.SameLine();
         if (IconButton("##camera", FontAwesomeIcon.Video, Loc.T("复刻照片镜头（会改动 GPose 相机）"), _session is not null && _clientState.IsGPosing))
@@ -884,7 +1019,14 @@ public sealed partial class MainWindow : Window, IDisposable
             Restore();
         ImGui.SameLine();
         if (IconButton("##export", FontAwesomeIcon.Save, Loc.T("导出 Brio 姿势文件（.pose）"), hasResult))
-            Export();
+            ImGui.OpenPopup("##exportMenu");
+        if (ImGui.BeginPopup("##exportMenu"))
+        {
+            if (ImGui.MenuItem(Loc.T("导出 .pose 文件…"))) Export();
+            if (ImGui.MenuItem(Loc.T("存到 Brio 姿势库"), _imagePath is not null)) SaveCurrentToBrio();
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.F("带预览图和标签保存到 {0}，在 Brio 资料库里直接能用", BrioPoseLibrary.Folder));
+            ImGui.EndPopup();
+        }
         ImGui.SameLine();
         var autoPush = _config.PushOnRelease;
         if (ImGui.Checkbox("##autopush", ref autoPush))
@@ -902,30 +1044,10 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void DrawImageTab()
     {
-        if (_images.Count <= 1)
-        {
-            DrawImagePreview();
-            return;
-        }
-        var avail = ImGui.GetContentRegionAvail();
-        var width = Math.Min(190 * ImGuiHelpers.GlobalScale, avail.X * 0.42f);
-        using (var list = ImRaii.Child("##imageList", new Vector2(width, 0), true))
-            if (list) DrawImageList();
-        ImGui.SameLine();
-        using (var preview = ImRaii.Child("##imagePreview", new Vector2(0, 0)))
-            if (preview) DrawImagePreview();
-    }
-
-    private void DrawImagePreview()
-    {
         var showMhr = _config.ShowMhrOverlay;
         var showFf = _config.ShowFfxivOverlay;
-        var overlayRowWidth = ImGui.CalcTextSize(Loc.T("识别骨架（绿）")).X
-            + ImGui.CalcTextSize(Loc.T("FF14 骨架（橙）")).X
-            + ImGui.GetFrameHeight() * 2 + ImGui.GetStyle().ItemSpacing.X * 3;
-        var sameRow = ImGui.GetContentRegionAvail().X >= overlayRowWidth;
         var toggled = ImGui.Checkbox(Loc.T("识别骨架（绿）"), ref showMhr);
-        if (sameRow) ImGui.SameLine();
+        ImGui.SameLine();
         toggled |= ImGui.Checkbox(Loc.T("FF14 骨架（橙）"), ref showFf);
         if (toggled)
         {
@@ -937,18 +1059,13 @@ public sealed partial class MainWindow : Window, IDisposable
         var avail = ImGui.GetContentRegionAvail();
         if (_texture is null || _session is null)
         {
-            var message = _imageLoadTask is not null ? Loc.T("加载所选图片中…")
-                : _recognizing && _images.Any(i => i.Session is not null) ? Loc.T("从左侧选择已识别的图片以预览和应用")
-                : _recognizing ? Loc.T("正在预识别全部图片…")
-                : _images.Count > 1 ? Loc.T("从左侧列表选择图片以加载预览")
-                : Loc.T("点左上角文件夹选图\n或把图片拖到这里");
-            ImGui.Button(message, new Vector2(avail.X, Math.Max(80, avail.Y)));
+            ImGui.Button(_recognizing ? Loc.T("识别中…") : Loc.T("点左上角图库按钮选图\n或把图片 / 文件夹拖到这里"), new Vector2(avail.X, Math.Max(80, avail.Y)));
             DropTarget();
             return;
         }
         var imgW = _session.ImageSize[0];
         var imgH = _session.ImageSize[1];
-        var scale = Math.Min(Math.Max(1, avail.X) / imgW, Math.Max(1, avail.Y) / imgH);
+        var scale = Math.Min(avail.X / imgW, avail.Y / imgH);
         var size = new Vector2(imgW, imgH) * scale;
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail.X - size.X) / 2);
         var origin = ImGui.GetCursorScreenPos();
@@ -978,30 +1095,28 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
-    private const string DragLabel = "PosegraphImage";
+    private const string DragLabel = LibraryWindow.ExternalDragLabel;
 
-    private static bool IsImage(string path)
-        => ImageFiles.IsImage(path);
+    private static bool IsImage(string path) => ImageLibrary.IsImage(path);
 
     /// <summary>
     /// 外部文件拖放分两步：每帧用 CreateImGuiSource 把系统拖动转成 ImGui 拖放负载，再由目标区域用 CreateImGuiTarget 接收。
     /// 拖着图片进入窗口时自动切到图像页。
     /// </summary>
+    /// <summary>
+    /// 外部文件拖放分两步：Plugin 每帧用 CreateImGuiSource 把系统拖动转成 ImGui 拖放负载（见 Plugin.DrawDragSource），
+    /// 再由目标区域用 CreateImGuiTarget 接收。拖着图片进入窗口时自动切到图像页。
+    /// </summary>
     private void DragSource()
     {
-        _dragDrop.CreateImGuiSource(DragLabel, m => m.Files.Any(IsImageInput), m =>
-        {
-            ImGui.TextUnformatted(Loc.F("松开以导入 {0} 个文件或文件夹", m.Files.Count(IsImageInput)));
-            return true;
-        });
-        if (_dragDrop.IsDragging && _dragDrop.Files.Any(IsImageInput))
+        if (_dragDrop.IsDragging && (_dragDrop.Files.Any(IsImage) || _dragDrop.Directories.Count > 0))
             _selectTab = 0;
     }
 
     private void DropTarget()
     {
-        if (!_dragDrop.CreateImGuiTarget(DragLabel, out var files, out _)) return;
-        ImportImagePaths(files);
+        if (_dragDrop.CreateImGuiTarget(DragLabel, out var files, out var dirs))
+            ImportDropped([.. files, .. dirs]);
     }
 
     // ---------------- 3D 火柴人
@@ -1020,6 +1135,29 @@ public sealed partial class MainWindow : Window, IDisposable
         return side + (JointNames.TryGetValue(key, out var n) ? Loc.T(n) : bone);
     }
 
+    /// <summary>把当前的修正（预设、幅度、手动关节偏移等调整参数）存进这张图的识别缓存，下次打开这张图自动恢复。</summary>
+    private void DrawCorrectionBar()
+    {
+        var sha1 = _imageSha1;
+        var saved = sha1 is not null && Library.HasCorrection(sha1);
+        if (IconButton("##saveFix", FontAwesomeIcon.Save, Loc.T("保存修正：把当前的关节偏移和调整参数存进这张图的识别缓存，下次打开自动恢复"), sha1 is not null))
+        {
+            Library.WriteCorrection(sha1!, new SavedCorrection(_preset, _params.Clone(), DateTime.Now));
+            _correctionLoaded = true;
+            SetStatus(Loc.T("已保存这张图的修正"), Green);
+        }
+        ImGui.SameLine();
+        if (IconButton("##clearFix", FontAwesomeIcon.Trash, Loc.T("删除这张图保存的修正（当前调整不变）"), saved))
+        {
+            Library.DeleteCorrection(sha1!);
+            _correctionLoaded = false;
+            SetStatus(Loc.T("已删除这张图保存的修正"), Yellow);
+        }
+        ImGui.SameLine();
+        var offsets = _params.Offsets.Count(kv => kv.Value.Any(v => v != 0));
+        ImGui.TextDisabled(saved ? Loc.F("这张图有保存的修正（手动偏移 {0} 处）", offsets) : Loc.F("未保存（手动偏移 {0} 处）", offsets));
+    }
+
     private void DrawStickTab()
     {
         if (_result?.Stick is not { } stick)
@@ -1027,6 +1165,7 @@ public sealed partial class MainWindow : Window, IDisposable
             ImGui.TextDisabled(Loc.T("识别后在这里查看 FF14 骨架（拖动旋转、滚轮缩放、点选关节微调）"));
             return;
         }
+        DrawCorrectionBar();
         var avail = ImGui.GetContentRegionAvail();
         var panel = _selected is null ? ImGui.GetTextLineHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
         var size = new Vector2(avail.X, Math.Max(140, avail.Y - panel));
@@ -1234,6 +1373,7 @@ public sealed partial class MainWindow : Window, IDisposable
         if (IconButton("##resetAll", FontAwesomeIcon.UndoAlt, Loc.T("全部恢复预设值（含手动偏移）")))
         {
             _params = RetargetParams.Preset(_preset);
+            _correctionLoaded = false;
             if (_config.SavedParams.Remove(_preset)) _pi.SavePluginConfig(_config);
             _savedParams = ParamsSnapshot(_params);
             RequestRetarget(_config.PushOnRelease);

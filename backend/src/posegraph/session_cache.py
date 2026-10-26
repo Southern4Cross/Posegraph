@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from collections import OrderedDict
 from collections.abc import Iterator, MutableMapping
@@ -10,7 +9,7 @@ from dataclasses import dataclass
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import BinaryIO
 
-import numpy as np
+from . import session_archive
 
 
 @dataclass
@@ -45,31 +44,12 @@ class SessionCache(MutableMapping[str, Session]):
             return len(self._memory)
 
     def _save(self, session: Session) -> BinaryIO:
-        arrays = {"preview": np.frombuffer(session.preview_png, dtype=np.uint8)}
-        humans = []
-        for index, human in enumerate(session.humans):
-            fields = {}
-            for key, value in human.items():
-                if value is None or isinstance(value, (str, bool, int, float)):
-                    fields[key] = {"value": value}
-                elif isinstance(value, np.generic):
-                    fields[key] = {"value": value.item()}
-                else:
-                    array = np.asarray(value)
-                    if array.dtype.hasobject:
-                        raise ValueError("Session arrays cannot contain Python objects")
-                    array_key = f"human_{index}_{len(fields)}"
-                    arrays[array_key] = array
-                    fields[key] = {"array": array_key}
-            humans.append(fields)
-        metadata = {"id": session.id, "name": session.name, "image_size": session.image_size,
-                    "inference_ms": session.inference_ms, "humans": humans}
-        arrays["metadata"] = np.frombuffer(json.dumps(metadata, ensure_ascii=False).encode("utf-8"), dtype=np.uint8)
         # Keep the OS delete-on-close handle open. On Windows this also removes
         # image data when the plugin forcibly terminates the backend process.
         archive = NamedTemporaryFile(mode="w+b", suffix=".npz", dir=self._directory.name)
         try:
-            np.savez_compressed(archive, **arrays)
+            archive.write(session_archive.pack(session.name, session.image_size, session.preview_png,
+                                               session.humans, session.inference_ms))
             archive.flush()
             archive.seek(0)
         except BaseException:
@@ -78,14 +58,11 @@ class SessionCache(MutableMapping[str, Session]):
         return archive
 
     @staticmethod
-    def _load(stream: BinaryIO) -> Session:
+    def _load(stream: BinaryIO, sid: str) -> Session:
         stream.seek(0)
-        with np.load(stream, allow_pickle=False) as archive:
-            metadata = json.loads(archive["metadata"].tobytes().decode("utf-8"))
-            humans = [{key: archive[field["array"]].copy() if "array" in field else field["value"]
-                       for key, field in fields.items()} for fields in metadata["humans"]]
-            return Session(metadata["id"], metadata["name"], tuple(metadata["image_size"]),
-                           archive["preview"].tobytes(), humans, metadata["inference_ms"])
+        data = session_archive.unpack(stream.read())
+        return Session(sid, data["name"], data["image_size"], data["preview_png"],
+                       data["humans"], data["inference_ms"])
 
     def _make_room(self) -> None:
         if len(self._memory) < self.max_in_memory:
@@ -106,7 +83,7 @@ class SessionCache(MutableMapping[str, Session]):
                 return self._memory[sid]
             if sid not in self._disk:
                 raise KeyError(sid)
-            session = self._load(self._disk[sid])
+            session = self._load(self._disk[sid], sid)
             self._make_room()
             self._memory[sid] = session
             return session

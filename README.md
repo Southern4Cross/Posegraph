@@ -21,9 +21,9 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 
 - **Photo and illustration support**, full or half body, fingers included. An *Illustration* preset tones down
   the exaggerated head/neck proportions of drawn art.
-- **All playable male races.** The race is read from the character's appearance (or chosen manually).
+- **All playable races, male and female.** The race is read from the character's appearance (or chosen manually).
   Midlander-type and Elezen males are verified in game; Lalafell and Roegadyn/Hrothgar had a body-proportion bug after changing race, fixed in 0.3.2.
-  Female skeletons are **not supported yet** (their data is included, but the retargeting rules are tuned for male skeletons).
+  Female skeletons were checked offline against the vanilla bodies with the IVCS skeleton and behave like the male ones; awaiting a retest in game.
 - **Live tuning without re-running the AI**: per-region amplitude (spine, neck, head, clavicle, wrist), hand contact
   compensation, gravity correction, ground snapping, helper-bone strength, and manual per-joint offsets in a 3D stick figure.
   Dragging a slider updates the preview; releasing it applies the pose (Brio's undo history stays clean).
@@ -85,34 +85,32 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
 
 1. Enter GPose and select the actor (or pick one in the actor list, which shows players, actors created in Brio
    and humanoid NPCs such as retainers).
-2. Click the folder icon and choose **Choose images (multiple)** or **Choose folder (including subfolders)**.
-   You can also drop images or folders onto the *Image* tab (jpg, png, webp, bmp, gif first frame, tiff, avif).
+2. Open the library (pictures icon) and double-click an image, or drag images / folders onto the *Image* tab
+   (jpg, png, webp, bmp, gif first frame, tiff, avif).
 3. The first recognition loads the model (about 10–20 s); after that a recognition takes a few seconds.
-   For multiple images, Posegraph pre-recognizes the batch in the background. As each image finishes, click its successful
-   row in the left-hand list to load its preview and pose while the remaining images continue recognizing.
-   Only the image you select loads; its application follows the existing *Apply to actor right after recognition* setting.
-   A single image loads automatically.
+   Results are cached by file content, so opening a recognized image again is instant.
 4. Check the overlay (*Image* tab: green = detected skeleton, orange = FFXIV skeleton) and the *3D* tab.
 5. Tune on the *Tuning* tab, read the *Hints* tab, then **Apply** (▶). Use the camera button to match the photo camera,
-   ↶ to restore the pose from before the first apply, and the disk button to export a `.pose` file.
+   ↶ to restore the pose from before the first apply, and the disk button to export a `.pose` file or save it to the
+   Brio pose library.
 
-Update the backend together with the plugin when importing more than eight images. The backend keeps up to eight recognized
-sessions in RAM and stores additional sessions in temporary disk files, so earlier results remain available for selection.
-Replacing the imported batch or unloading the plugin clears its cached sessions and temporary files.
+### Library
 
-Multi-image recognition is sequential by default (**1**). In *Settings* → *Recognition backend* →
-**Multi-image recognition concurrency**, choose **1–8** from the dropdown; changes take effect with the next batch.
-Settings above **1** require an updated, restarted backend. If the running backend cannot confirm support, Posegraph
-reports an error and does not start the batch; the default **1** remains compatible with older backends.
-Parallel recognition uses isolated workers, each loading a complete model, so RAM and VRAM requirements grow with the
-worker count. The estimates to the right of the dropdown budget approximately **3 GB VRAM per GPU worker** (plus
-**0.75 GB** if MHR also runs on the GPU) and **4 GB RAM per worker**. CPU recognition has no inference VRAM budget;
-*Auto* shows the GPU plan and may fall back to CPU. Actual extra memory depends on the mode and images; estimates exclude
-the game, image and session caches, and residual GPU context. Multi-image/folder imports and three-way CPU recognition have
-been manually verified. Higher concurrency may not improve speed; GPU parallel throughput and peak resource use remain unmeasured. **Stop pre-recognition** lets in-flight images finish
-and skips images that have not started.
+- Images live in `Documents\Posegraph\Images` (imports, folder imports up to 500 images, and clipboard pastes are copied
+  there). Existing folders can be added as sources without copying.
+- Organize with subfolders, tags (search with `#tag`) and favorites; rename, move (also by dragging onto a folder) and
+  delete to the Recycle Bin.
+- Batch-recognize a selection; recognized images show a green check. Recognition results are cached in
+  `Documents\Posegraph\Cache`.
+- *Save to the Brio pose library* writes `.pose` files with a preview image and tags to `Documents\Brio\Poses\Posegraph`,
+  where they show up in Brio's library.
 
-Status bar icons, left to right: Brio, GPose, IVCS (shown once the game pose has been read), backend, VRAM, RAM;
+Library batches are sequential by default. Choose **1–8** under *Settings → Recognition backend → Multi-image recognition concurrency*; changes apply to the next batch.
+Parallel recognition requires an updated, restarted backend. Each isolated worker loads a complete model, budgeting approximately **3 GB VRAM** (plus **0.75 GB** when MHR runs on GPU) and **4 GB RAM** per worker. CPU inference has no VRAM budget; Auto may fall back to CPU.
+Estimates exclude the game, images/caches and residual CUDA contexts. GPU parallel throughput and peak memory remain unmeasured. Completed library items can be opened while other jobs continue.
+Stopping a batch skips queued items and lets running jobs save their archives and release temporary sessions. Content-hash caches and restoration after a backend restart are preserved; more than eight intermediate sessions spill to temporary disk until archived and deleted.
+
+Status bar icons, left to right: Brio, GPose, IVCS (shown once an actor is selected in GPose), backend, VRAM, RAM;
 hover for details.
 
 ### Settings
@@ -122,7 +120,6 @@ hover for details.
 | Language | Auto | Chinese if the game client is Chinese, otherwise the Dalamud UI language decides; English if neither is Chinese |
 | Device | Auto | GPU when ~3 GB VRAM is free, otherwise CPU. *GPU* forces the GPU, *CPU* never touches VRAM |
 | Unload model | Right after recognition | Frees VRAM/RAM for the game; the next recognition reloads the model (~5–10 s) |
-| Multi-image recognition concurrency | 1 | 1–8 complete model workers; takes effect next batch, using more RAM/VRAM |
 | Keep MHR on the CPU | On | Saves ~750 MB VRAM in GPU mode, ~0.5 s slower |
 | Apply when a slider is released | On | Turn off to apply manually |
 
@@ -134,7 +131,7 @@ hover for details.
 | Elezen ♂ | Elezen | verified in game |
 | Roegadyn-type ♂ | Roegadyn, Hrothgar | fixed in 0.3.2, awaiting a retest in game |
 | Lalafell | Lalafell ♂ / ♀ | fixed in 0.3.2, awaiting a retest in game |
-| Female skeletons | all | **not supported yet** |
+| Female skeletons | all | checked offline, awaiting a retest in game |
 
 If the detected race is wrong (race-changing mods, Customize+ scaling), choose it manually in the race list next to the actor list.
 The choice is remembered per actor for the GPose session; switching between actors does not clear their poses in Brio.

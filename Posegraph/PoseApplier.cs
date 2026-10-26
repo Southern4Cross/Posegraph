@@ -41,24 +41,19 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
     public Task<ActorIdentity?> IdentifyAsync(int? actor) => framework.RunOnFrameworkThread(() => Identify(actor));
 
     /// <summary>清除 Brio 姿势栈（保留模型位置），等几帧让 Brio 读到的骨骼刷新。</summary>
-    public async Task<bool> ResetPoseAsync(int? actor, CancellationToken ct = default)
+    public async Task<bool> ResetPoseAsync(int? actor)
     {
         var ok = await framework.RunOnFrameworkThread(() =>
-        {
-            ct.ThrowIfCancellationRequested();
-            return clientState.IsGPosing && Resolve(actor) is { } a && brio.ResetPoseKeepTransform(a);
-        });
+            clientState.IsGPosing && Resolve(actor) is { } a && brio.ResetPoseKeepTransform(a));
         if (ok) await framework.DelayTicks(FreezeSettleTicks);
-        ct.ThrowIfCancellationRequested();
         return ok;
     }
 
     /// <summary>冻结动画、等几帧再导入（否则待机动画会让姿势漂移），之后再应用一次。返回错误信息，成功为 null。</summary>
-    public async Task<string?> ApplyAsync(int? actor, string poseJson, CancellationToken ct = default)
+    public async Task<string?> ApplyAsync(int? actor, string poseJson)
     {
         var error = await framework.RunOnFrameworkThread(() =>
         {
-            ct.ThrowIfCancellationRequested();
             if (!clientState.IsGPosing) return Loc.T("不在 GPose 中");
             var a = Resolve(actor);
             if (a is null) return Loc.T("找不到角色（请在 GPose 中选中目标）");
@@ -70,11 +65,7 @@ public sealed class PoseApplier(IFramework framework, IClientState clientState, 
         for (var i = 0; i < 2; i++)
         {
             if (i > 0) await framework.DelayTicks(SecondApplyTicks);
-            var ok = await framework.RunOnFrameworkThread(() =>
-            {
-                ct.ThrowIfCancellationRequested();
-                return Resolve(actor) is { } a && brio.ApplyPose(a, poseJson);
-            });
+            var ok = await framework.RunOnFrameworkThread(() => Resolve(actor) is { } a && brio.ApplyPose(a, poseJson));
             if (!ok) return Loc.T("Brio 应用姿势失败");
         }
         return null;

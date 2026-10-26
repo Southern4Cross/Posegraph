@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Posegraph/Library/RecognitionService.cs" Link="RecognitionService.cs" />
+    <Compile Include="../../Posegraph/Library/ImageLibrary.cs" Link="ImageLibrary.cs" />
+    <Compile Include="../../Posegraph/Backend/BackendClient.cs" Link="BackendClient.cs" />
+    <Compile Include="../../Posegraph/Backend/Dto.cs" Link="Dto.cs" />
+    <Compile Include="../BackendClient.Checks/Stubs.cs" Link="Stubs.cs" />
+  </ItemGroup>
+</Project>
