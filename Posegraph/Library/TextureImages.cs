@@ -51,6 +51,14 @@ internal static class TextureImages
         }
     }
 
+    /// <summary>图片字节 → 原尺寸 PNG（经 Windows 解码：后端解码不了的格式，如装了扩展的 HEIC、JPEG XR）。</summary>
+    public static async Task<byte[]> ToPngAsync(ITextureProvider textures, ITextureReadbackProvider readback,
+                                                byte[] image, CancellationToken ct = default)
+    {
+        using var texture = await textures.CreateFromImageAsync(image, "Posegraph image", ct);
+        return await EncodePngAsync(readback, texture, ct);
+    }
+
     /// <summary>图片字节 → 缩小后的 PNG（导出到 Brio 姿势库的预览图）。</summary>
     public static async Task<byte[]> ThumbnailPngAsync(ITextureProvider textures, ITextureReadbackProvider readback,
                                                        byte[] image, int maxSide, CancellationToken ct = default)

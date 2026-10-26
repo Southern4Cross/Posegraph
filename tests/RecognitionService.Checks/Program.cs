@@ -11,7 +11,8 @@ await OldBackendFallsBackToSerial();
 await BackendNoticesShownOnce();
 await ForegroundNeverParallel();
 await SameContentInParallel();
-Console.WriteLine("6 recognition service scenarios passed (real service/library/client; loopback HTTP).");
+await UndecodableImageRetriesAsPng();
+Console.WriteLine("7 recognition service scenarios passed (real service/library/client; loopback HTTP).");
 
 static void Check(bool value, string message)
 {
@@ -108,6 +109,37 @@ static async Task SameContentInParallel()
     Console.WriteLine("PASS same-content images in parallel share one cache file");
 }
 
+static async Task UndecodableImageRetriesAsPng()
+{
+    byte[] Png(byte[] _) => [0x89, (byte)'P', (byte)'N', (byte)'G'];
+    using (var f = new Fixture(1, image => Task.FromResult(Png(image))))
+    {
+        f.Backend.OnlyPng = true;
+        var (info, _) = await f.Service.OpenAsync(f.Images(1)[0]);
+        Check(info.SessionId.Length > 0 && f.Backend.Created == 2, "undecodable image was not retried once as PNG");
+    }
+    using (var f = new Fixture(1, _ => throw new InvalidOperationException("Windows cannot decode it either")))
+    {
+        f.Backend.OnlyPng = true;
+        var error = await Record(() => f.Service.OpenAsync(f.Images(1)[0]));
+        Check(error is BackendException { StatusCode: 400 } && error.Message.Contains("无法解码图片") && f.Backend.Created == 1,
+            "a failed conversion must surface the backend's original decode error");
+    }
+    using (var f = new Fixture(1, image => Task.FromResult(Png(image))))
+    {
+        f.Backend.Fail500 = true;
+        var error = await Record(() => f.Service.OpenAsync(f.Images(1)[0]));
+        Check(error is BackendException { StatusCode: 503 } && f.Backend.Created == 1, "only decode errors (400) may be retried");
+    }
+    Console.WriteLine("PASS undecodable images retry once as PNG decoded by Windows");
+}
+
+static async Task<Exception?> Record(Func<Task> action)
+{
+    try { await action(); return null; }
+    catch (Exception ex) { return ex; }
+}
+
 sealed class Fixture : IDisposable
 {
     public readonly string Directory = Path.Combine(Path.GetTempPath(), "Posegraph-LibraryChecks-" + Guid.NewGuid().ToString("N"));
@@ -116,12 +148,12 @@ sealed class Fixture : IDisposable
     public readonly ImageLibrary Library;
     public readonly RecognitionService Service;
 
-    public Fixture(int parallelism)
+    public Fixture(int parallelism, Func<byte[], Task<byte[]>>? toPng = null)
     {
         System.IO.Directory.CreateDirectory(Directory);
         Library = new ImageLibrary(Directory, Directory);
         Client = new BackendClient(() => Backend.Port);
-        Service = new RecognitionService(Library, Client, () => true) { Parallelism = () => parallelism };
+        Service = new RecognitionService(Library, Client, () => true) { Parallelism = () => parallelism, ToPng = toPng };
     }
 
     public string Image(string name, int marker)
@@ -151,7 +183,7 @@ sealed class FakeBackend : IDisposable
     public readonly ConcurrentQueue<string> Deleted = new();
     public int Created, Parallel, Held, Peak, Unloaded;
     private int _active, _ids;
-    public bool OldBackend;
+    public bool OldBackend, OnlyPng, Fail500;
     public object? State;
     public int Port => _server.Port;
 
@@ -174,6 +206,11 @@ sealed class FakeBackend : IDisposable
             case ("POST", "/sessions"):
             {
                 Interlocked.Increment(ref Created);
+                var body = new byte[4];
+                var read = await req.InputStream.ReadAsync(body);
+                if (OnlyPng && (read < 2 || body[0] != 0x89 || body[1] != (byte)'P'))
+                    return new MockResponse(400, "{\"detail\":\"无法解码图片：cannot identify image file\"}");
+                if (Fail500) return new MockResponse(503, "{\"detail\":\"模型加载失败\"}");
                 if (query.Contains("parallel=true")) Interlocked.Increment(ref Parallel);
                 if (query.Contains("hold=true")) Interlocked.Increment(ref Held);
                 var now = Interlocked.Increment(ref _active);

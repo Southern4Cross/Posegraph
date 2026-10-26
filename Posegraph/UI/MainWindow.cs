@@ -58,6 +58,9 @@ public sealed partial class MainWindow : Window, IDisposable
     /// <summary>打开 / 关闭图库窗口（由 Plugin 接上）。</summary>
     public Action? ToggleLibrary { get; set; }
 
+    /// <summary>主窗口关闭时（关闭按钮、指令、退出 GPose 自动关闭）调用：图库、角色列表跟着关（由 Plugin 接上）。</summary>
+    public Action? Closed { get; set; }
+
     /// <summary>辅助视角菜单（由 Plugin 接上，与图库右键共用）。</summary>
     public AuxViewsMenu? AuxMenu { get; set; }
     private readonly SystemProbe _probe = new();
@@ -141,7 +144,11 @@ public sealed partial class MainWindow : Window, IDisposable
         _server = server;
         _client = new BackendClient(() => _config.BackendPort);
         Library = new ImageLibrary(pi.GetPluginConfigDirectory());
-        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0) { Parallelism = () => _config.BatchRecognitionParallelism };
+        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0)
+        {
+            Parallelism = () => _config.BatchRecognitionParallelism,
+            ToPng = image => TextureImages.ToPngAsync(_textures, _readback, image),
+        };
         Library.AuxChanged += OnAuxChanged;
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
@@ -162,6 +169,8 @@ public sealed partial class MainWindow : Window, IDisposable
     public override void PreDraw() => PosegraphTheme.Push();
 
     public override void PostDraw() => PosegraphTheme.Pop();
+
+    public override void OnClose() => Closed?.Invoke();
 
     public void OpenSettings()
     {

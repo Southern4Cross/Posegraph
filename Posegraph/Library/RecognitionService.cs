@@ -50,11 +50,26 @@ public sealed partial class RecognitionService(ImageLibrary library, BackendClie
         }
     }
 
-    private Task<SessionInfo> CreateAsync(byte[] bytes, string name, bool parallel = false)
+    /// <summary>图片字节 → PNG（经 Windows 解码）；后端解码不了时用来转码重试，见 CreateAsync。</summary>
+    public Func<byte[], Task<byte[]>>? ToPng { get; init; }
+
+    private async Task<SessionInfo> CreateAsync(byte[] bytes, string name, bool parallel = false)
     {
         var hold = Volatile.Read(ref _batches) > 0;
         if (hold) Interlocked.Exchange(ref _held, 1);
-        return client.CreateSessionAsync(bytes, name, hold, parallel);
+        try
+        {
+            return await client.CreateSessionAsync(bytes, name, hold, parallel);
+        }
+        catch (BackendException ex) when (ex.StatusCode == 400 && ToPng is not null)
+        {
+            // 后端解码不了（HEIC、JPEG XL 等改了扩展名的图）：Windows 能解码的话转成 PNG 再试一次，解不了就报原来的错
+            byte[]? png = null;
+            try { png = await ToPng(bytes); }
+            catch { }
+            if (png is null) throw;
+            return await client.CreateSessionAsync(png, name, hold, parallel);
+        }
     }
 
     public int Pending => _queue.Count;

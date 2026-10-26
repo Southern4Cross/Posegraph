@@ -72,6 +72,7 @@ public sealed class Plugin : IDalamudPlugin
         _windows.AddWindow(_update);
         _main.ShowChangelog = () => _update.IsOpen = true;
         _main.ToggleLibrary = _library.Toggle;
+        _main.Closed = () => _library.IsOpen = _split.IsOpen = false;
         _main.LibraryChanged = _library.Refresh;
         _dragDrop = dragDrop;
         _framework = framework;
