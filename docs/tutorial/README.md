@@ -181,7 +181,9 @@ The "character list" button in the second toolbar row opens this window, docked 
 
 Bindings only last for the current GPose session.
 
-> **In-game screenshot to come**: several characters posed together (suggested file name `images/ingame-split.png`).
+Three characters, one image each, after "Apply all":
+
+![Several characters posed together](images/ingame-split.jpg)
 
 ## 11. Camera matching, export and restore
 
