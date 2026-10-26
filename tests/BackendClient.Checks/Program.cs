@@ -1,5 +1,3 @@
-using System.Net;
-using System.Net.Sockets;
 using System.Text.Json;
 using Posegraph;
 using Posegraph.Backend;
@@ -16,6 +14,7 @@ var checks = new (string Name, Func<Task> Run)[]
     ("Propagates non-success HTTP status and backend detail", BackendError),
     ("Sends current Accept-Language on every configuration request", LanguageHeader),
     ("Preserves batch hold and escaped image names", BatchHold),
+    ("Uses one-model base resources for GPU, CPU, MHR and auto fallback", ResourceBaseBudget),
 };
 
 foreach (var (name, run) in checks)
@@ -23,7 +22,7 @@ foreach (var (name, run) in checks)
     await run().WaitAsync(TimeSpan.FromSeconds(20));
     Console.WriteLine($"PASS {name}");
 }
-Console.WriteLine($"{checks.Length} BackendClient checks passed (production source linked, real loopback HTTP).");
+Console.WriteLine($"{checks.Length} BackendClient/resource checks passed (production source linked, real loopback HTTP).");
 
 static string Confirmation(int count)
     => JsonSerializer.Serialize(new { model = new { config = new { recognitionParallelism = count } } });
@@ -153,6 +152,25 @@ static async Task BatchHold()
         "Session request lost its name or language");
     Assert(requests[0].Query!.EndsWith("&hold=true") && !requests[1].Query!.Contains("hold="),
         "Batch hold was lost or applied to an ordinary foreground request");
+}
+
+static Task ResourceBaseBudget()
+{
+    var gpu = RecognitionResources.Estimate("cuda", true);
+    Assert(gpu.Scenario == RecognitionResourceScenario.Gpu && gpu.VramMB == SystemProbe.RequiredVramMB &&
+        gpu.RamMB == SystemProbe.RequiredRamMB, "Single-model baseline changed");
+    var mhr = RecognitionResources.Estimate("cuda", false);
+    Assert(mhr.VramMB == gpu.VramMB + 750 && mhr.RamMB == gpu.RamMB, "MHR allowance must be added only once");
+    var cpu = RecognitionResources.Estimate("cpu", true);
+    Assert(cpu.Scenario == RecognitionResourceScenario.Cpu && cpu.VramMB == 0 && cpu.RamMB == gpu.RamMB &&
+        cpu == RecognitionResources.Estimate("cpu", false), "CPU mode must ignore GPU/MHR VRAM allowances");
+    foreach (var device in new[] { "auto", "unknown", "" })
+    {
+        var automatic = RecognitionResources.Estimate(device, true);
+        Assert(automatic.Scenario == RecognitionResourceScenario.Auto && automatic.VramMB == gpu.VramMB &&
+            automatic.RamMB == gpu.RamMB, "Unknown/auto device must retain a qualified GPU planning scenario");
+    }
+    return Task.CompletedTask;
 }
 
 static void Assert(bool condition, string message)

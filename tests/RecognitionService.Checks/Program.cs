@@ -1,7 +1,5 @@
 using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using Posegraph.Backend;
@@ -234,30 +232,18 @@ sealed class Fixture : IDisposable
 sealed record Job(string Id, TaskCompletionSource<bool> Completion, string Name, bool Hold);
 sealed class ScriptedBackend : IDisposable
 {
-    private readonly HttpListener _listener = new();
+    private readonly LoopbackServer _server;
     private readonly Channel<Job> _jobs = Channel.CreateUnbounded<Job>();
     public readonly ConcurrentQueue<string> Deleted = new();
     public readonly ConcurrentQueue<int> Configured = new();
     public int Created, Restored, Peak, Unloaded;
     private int _active, _ids;
     public bool ConfigError, ArchiveError, RejectArchive, ViewsError;
-    public int Port { get; }
-    public ScriptedBackend()
-    {
-        using var probe = new TcpListener(IPAddress.Loopback, 0); probe.Start();
-        Port = ((IPEndPoint)probe.LocalEndpoint).Port; probe.Stop();
-        _listener.Prefixes.Add($"http://127.0.0.1:{Port}/"); _listener.Start();
-        _ = Listen();
-    }
+    public int Port => _server.Port;
+    public ScriptedBackend() => _server = new LoopbackServer(Handle);
     public async Task<Job> Next() => await _jobs.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
-    private async Task Listen()
+    private async Task<MockResponse> Handle(HttpListenerRequest req)
     {
-        try { while (_listener.IsListening) _ = Handle(await _listener.GetContextAsync()); }
-        catch (HttpListenerException) { } catch (ObjectDisposedException) { }
-    }
-    private async Task Handle(HttpListenerContext context)
-    {
-        var req = context.Request;
         var path = req.Url!.AbsolutePath;
         var status = 200;
         string body;
@@ -303,12 +289,9 @@ sealed class ScriptedBackend : IDisposable
         else if (path.EndsWith("/archive")) { status = ArchiveError ? 500 : 200; body = "archive-bytes"; }
         else if (req.HttpMethod == "DELETE") { Deleted.Enqueue(path.Split('/')[2]); body = "{\"ok\":true}"; }
         else { status = 404; body = "{}"; }
-        var bytes = Encoding.UTF8.GetBytes(body);
-        context.Response.StatusCode = status; context.Response.ContentType = "application/json";
-        context.Response.ContentLength64 = bytes.Length;
-        try { await context.Response.OutputStream.WriteAsync(bytes); } finally { context.Response.Close(); }
+        return new(status, body);
     }
     private static string Session(string sid, string name, string? device)
         => JsonSerializer.Serialize(new { sessionId = sid, name, imageSize = new[] { 1, 1 }, inferenceMs = 1, device, humans = Array.Empty<object>() });
-    public void Dispose() { _listener.Close(); }
+    public void Dispose() => _server.Dispose();
 }

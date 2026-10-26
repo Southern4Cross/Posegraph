@@ -1,95 +1,48 @@
-"""Thread/lifecycle proof for the experimental pool, without Torch or a GPU."""
-import queue
+"""Thread/lifecycle proof for the shared pool, without Torch or a GPU."""
 import sys
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from posegraph.i18n import _lang
-from posegraph.inference_pool import InferenceFailure
-from posegraph.shared_inference import SharedInferencePool
-
-
-class ModelDouble:
-    def __init__(self):
-        self.loaded = False
-        self.active_device = self.active_precision = None
-        self.device_reason = ("手动指定",)
-        self.lock = threading.Lock()
-        self.load_calls = self.unloads = self.active = self.peak = 0
-        self.load_failures = self.unload_failures = 0
-        self.load_gate = self.unload_gate = None
-        self.load_started = threading.Event()
-        self.unload_started = threading.Event()
-        self.started = queue.Queue()
-        self.gates = {}
-        self.fail = set()
-        self.language_barrier = None
-        self.loads_language = []
-
-    @staticmethod
-    def wait(gate):
-        if gate is not None and not gate.wait(timeout=5):
-            raise TimeoutError("test gate was not released")
-
-    def load(self):
-        with self.lock:
-            if self.active:
-                raise AssertionError("load overlapped inference")
-            self.load_calls += 1
-            self.loads_language.append(_lang.get())
-        self.load_started.set()
-        self.wait(self.load_gate)
-        with self.lock:
-            if self.load_failures:
-                self.load_failures -= 1
-                raise ValueError("fake load failure")
-            self.loaded = True
-            self.active_device, self.active_precision = "cpu", "fp32"
-
-    def unload(self):
-        self.unload_started.set()
-        self.wait(self.unload_gate)
-        with self.lock:
-            if self.active:
-                raise AssertionError("unload overlapped inference")
-            if self.unload_failures:
-                self.unload_failures -= 1
-                raise ValueError("fake unload failure")
-            if self.loaded:
-                self.unloads += 1
-            self.loaded = False
-            self.active_device = self.active_precision = None
-
-    def estimate(self, marker):
-        with self.lock:
-            if not self.loaded:
-                raise AssertionError("estimate ran without weights")
-            self.active += 1
-            self.peak = max(self.peak, self.active)
-        language = _lang.get()
-        self.started.put((marker, threading.get_ident()))
-        try:
-            self.wait(self.gates.get(marker))
-            if self.language_barrier is not None:
-                self.language_barrier.wait(timeout=5)
-            if marker in self.fail:
-                raise ValueError("fake request failure")
-            return SimpleNamespace(marker=marker, language=language, after_language=_lang.get())
-        finally:
-            with self.lock:
-                self.active -= 1
-
-    def diagnostics(self, *, include_pointers=False):
-        return {"sharedModel": True, "includePointers": include_pointers}
+from posegraph.shared_inference import InferenceFailure, ModelLifecycle, SharedInferencePool
+from inference_fakes import FakeEstimator as ModelDouble, wait_until
 
 
 class SharedInferencePoolTests(unittest.TestCase):
+    def test_lifecycle_writer_waits_and_blocks_new_readers(self):
+        lifecycle = ModelLifecycle()
+        entered, release, read = threading.Event(), threading.Event(), threading.Event()
+
+        def writer():
+            with lifecycle.exclusive():
+                entered.set()
+                ModelDouble.wait(release)
+
+        def reader():
+            with lifecycle.inference():
+                read.set()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                with lifecycle.inference():
+                    changing = executor.submit(writer)
+                    wait_until(lambda: lifecycle._writers == 1)
+                    waiting = executor.submit(reader)
+                    self.assertFalse(entered.is_set())
+                    self.assertFalse(read.is_set())
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(read.is_set())
+            finally:
+                release.set()
+            changing.result(timeout=5)
+            waiting.result(timeout=5)
+        self.assertTrue(read.is_set())
+        self.assertEqual(lifecycle.active, 0)
+
     def pool(self, count=2, owner=None):
         owner = owner or ModelDouble()
         calls = []
@@ -103,21 +56,15 @@ class SharedInferencePoolTests(unittest.TestCase):
     def started(self, owner, count=1):
         return [owner.started.get(timeout=5) for _ in range(count)]
 
-    def wait(self, condition):
-        deadline = time.monotonic() + 5
-        while not condition():
-            if time.monotonic() > deadline:
-                self.fail("Timed out waiting for lifecycle transition")
-            time.sleep(.005)
 
     def test_one_factory_one_load_and_real_overlap_bounded_by_limit(self):
-        for limit in (1, 3):
+        for limit in range(1, 9):
             with self.subTest(limit=limit):
                 pool, owner, factories = self.pool(limit)
-                total = 7
+                total = limit + 3
                 owner.gates = {i: threading.Event() for i in range(total)}
                 with ThreadPoolExecutor(max_workers=total) as executor:
-                    futures = [executor.submit(pool.estimate, i, -1, "en") for i in range(total)]
+                    futures = [executor.submit(pool.estimate, i, "en") for i in range(total)]
                     running = self.started(owner, limit)
                     self.assertEqual(len({thread for _, thread in running}), limit)
                     self.assertEqual(owner.active, limit)
@@ -136,28 +83,8 @@ class SharedInferencePoolTests(unittest.TestCase):
                 self.assertEqual(factories[0], {"cuda_streams": True})
                 self.assertEqual(owner.load_calls, 1)
                 self.assertEqual(pool.states[0]["active"], 0)
-                self.assertEqual(pool.processes, [])
                 self.assertEqual(pool.states[0]["modelCopies"], 1)
 
-    def test_release_zero_waits_last_active_even_with_mixed_policies(self):
-        pool, owner, factories = self.pool()
-        owner.gates = {marker: threading.Event() for marker in ("zero", "resident")}
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            zero = executor.submit(pool.estimate, "zero", 0, "en")
-            resident = executor.submit(pool.estimate, "resident", -1, "en")
-            self.started(owner, 2)
-            owner.gates["zero"].set()
-            zero.result(timeout=5)
-            self.assertEqual(owner.unloads, 0)
-            self.assertTrue(owner.loaded)
-            self.assertEqual(pool.states[0]["active"], 1)
-            owner.gates["resident"].set()
-            resident.result(timeout=5)
-        self.assertFalse(owner.loaded)
-        self.assertEqual(owner.unloads, 1)
-        self.assertEqual(pool.estimate("next", -1).marker, "next")
-        self.assertEqual(owner.load_calls, 2)
-        self.assertEqual(len(factories), 1)
 
     def test_concurrent_preload_creates_one_copy_without_processes(self):
         pool, owner, factories = self.pool(8)
@@ -187,11 +114,11 @@ class SharedInferencePoolTests(unittest.TestCase):
         pool, owner, _ = self.pool(1)
         owner.gates["active"] = threading.Event()
         with ThreadPoolExecutor(max_workers=3) as executor:
-            active = executor.submit(pool.estimate, "active", -1, "en")
+            active = executor.submit(pool.estimate, "active", "en")
             self.started(owner)
-            waiting = executor.submit(pool.estimate, "waiting", -1, "en")
+            waiting = executor.submit(pool.estimate, "waiting", "en")
             closing = executor.submit(pool.close)
-            self.wait(lambda: pool.states[0]["closing"])
+            wait_until(lambda: pool.states[0]["closing"])
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 waiting.result(timeout=5)
             self.assertFalse(closing.done())
@@ -203,16 +130,16 @@ class SharedInferencePoolTests(unittest.TestCase):
         self.assertEqual(owner.unloads, 1)
         self.assertEqual(pool.states[0]["active"], 0)
         with self.assertRaisesRegex(RuntimeError, "closed"):
-            pool.estimate("new", -1)
+            pool.estimate("new")
 
     def test_close_waits_in_progress_load_without_admitting_its_request(self):
         pool, owner, _ = self.pool()
         owner.load_gate = threading.Event()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            estimate = executor.submit(pool.estimate, "never-admitted", -1, "en")
+            estimate = executor.submit(pool.estimate, "never-admitted", "en")
             self.assertTrue(owner.load_started.wait(timeout=5))
             closing = executor.submit(pool.close)
-            self.wait(lambda: pool.states[0]["closing"])
+            wait_until(lambda: pool.states[0]["closing"])
             self.assertFalse(closing.done())
             owner.load_gate.set()
             with self.assertRaisesRegex(RuntimeError, "closed"):
@@ -221,32 +148,14 @@ class SharedInferencePoolTests(unittest.TestCase):
         self.assertTrue(owner.started.empty())
         self.assertEqual(owner.unloads, 1)
 
-    def test_new_request_waits_for_release_unload_before_reloading(self):
-        pool, owner, _ = self.pool()
-        owner.unload_gate = threading.Event()
-        owner.gates["second"] = threading.Event()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(pool.estimate, "first", 0, "en")
-            self.assertTrue(owner.unload_started.wait(timeout=5))
-            self.assertEqual(self.started(owner)[0][0], "first")
-            second = executor.submit(pool.estimate, "second", -1, "en")
-            self.assertEqual(owner.load_calls, 1)
-            self.assertEqual(pool.states[0]["active"], 0)
-            owner.unload_gate.set()
-            first.result(timeout=5)
-            self.assertEqual(self.started(owner)[0][0], "second")
-            owner.gates["second"].set()
-            second.result(timeout=5)
-        self.assertEqual(owner.load_calls, 2)
-        self.assertEqual(owner.unloads, 1)
 
     def test_failed_request_frees_slot_without_poisoning_model_or_health(self):
         pool, owner, _ = self.pool()
         owner.fail.add("bad")
         owner.gates = {name: threading.Event() for name in ("bad", "good")}
         with ThreadPoolExecutor(max_workers=2) as executor:
-            bad = executor.submit(pool.estimate, "bad", -1, "en")
-            good = executor.submit(pool.estimate, "good", -1, "en")
+            bad = executor.submit(pool.estimate, "bad", "en")
+            good = executor.submit(pool.estimate, "good", "en")
             self.started(owner, 2)
             for gate in owner.gates.values():
                 gate.set()
@@ -254,7 +163,7 @@ class SharedInferencePoolTests(unittest.TestCase):
                 bad.result(timeout=5)
             self.assertEqual(caught.exception.status, 500)
             self.assertEqual(good.result(timeout=5).marker, "good")
-        self.assertEqual(pool.estimate("recovered", -1).marker, "recovered")
+        self.assertEqual(pool.estimate("recovered").marker, "recovered")
         self.assertEqual(owner.load_calls, 1)
         self.assertIsNone(pool.states[0]["error"])
         self.assertEqual(pool.states[0]["active"], 0)
@@ -298,7 +207,7 @@ class SharedInferencePoolTests(unittest.TestCase):
             original = _lang.set("zh" if language == "en" else "en")
             before = _lang.get()
             try:
-                result = pool.estimate(language, -1, language)
+                result = pool.estimate(language, language)
                 return before, _lang.get(), result.language, result.after_language
             finally:
                 _lang.reset(original)

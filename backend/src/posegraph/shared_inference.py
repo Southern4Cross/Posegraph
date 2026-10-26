@@ -1,7 +1,8 @@
-"""Experimental thread concurrency over one explicitly shareable model owner.
+"""Bounded inference threads over one explicitly shareable model owner.
 
 The owner is responsible for request-local model state and device scopes. This
-pool only coordinates load, bounded admission, delayed unload, and shutdown.
+pool only coordinates load, bounded admission, and shutdown. The service owns
+batch hold and idle release policies.
 It never makes a legacy mutable estimator thread-safe by wrapping it in threads.
 """
 from __future__ import annotations
@@ -11,7 +12,62 @@ from contextlib import contextmanager
 from typing import Callable
 
 from .i18n import _lang, set_language, tr
-from .inference_pool import InferenceFailure, estimator_info
+
+
+class InferenceFailure(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class ModelLifecycle:
+    """Concurrent readers (inference), exclusive writers (unload/configure)."""
+
+    def __init__(self):
+        self._condition = threading.Condition(threading.RLock())
+        self._active = 0
+        self._writers = 0
+        self._changing = False
+
+    @property
+    def active(self) -> int:
+        with self._condition:
+            return self._active
+
+    @contextmanager
+    def inference(self):
+        with self._condition:
+            self._condition.wait_for(lambda: not self._changing and self._writers == 0)
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        with self._condition:
+            self._writers += 1
+            try:
+                self._condition.wait_for(lambda: not self._changing and self._active == 0)
+                self._changing = True
+            finally:
+                self._writers -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._changing = False
+                self._condition.notify_all()
+
+
+def estimator_info(estimator, *, loading=False, error=None) -> dict:
+    return {"loaded": estimator.loaded, "loading": loading, "error": error,
+            "device": getattr(estimator, "active_device", None),
+            "precision": getattr(estimator, "active_precision", None),
+            "device_reason": getattr(estimator, "device_reason", ("",))}
 
 
 def create_shared_estimator(config: dict):
@@ -31,13 +87,7 @@ def _language(language: str):
 
 
 class SharedInferencePool:
-    """At most N inferences, one owner/model, no child processes.
-
-    release_after=0 unloads once the last active request finishes. Any such
-    request marks the current active group for release; concurrent requests
-    cannot unload weights underneath one another. Positive idle timeouts remain
-    the service's responsibility, as with the process-based InferencePool.
-    """
+    """At most N inferences, one owner/model; close waits for active requests."""
 
     def __init__(self, parallelism: int, config: dict, factory: Callable = create_shared_estimator):
         if isinstance(parallelism, bool) or not isinstance(parallelism, int) or not 1 <= parallelism <= 8:
@@ -50,7 +100,6 @@ class SharedInferencePool:
         self._active = 0
         self._loading = False
         self._changing = False
-        self._release_pending = False
         self._closing = False
         self._closed = False
         self._error: str | None = None
@@ -69,10 +118,6 @@ class SharedInferencePool:
     def states(self) -> list[dict]:
         with self._condition:
             return [self._state()]
-
-    @property
-    def processes(self) -> list:
-        return []
 
     def diagnostics(self, *, include_pointers=False) -> dict:
         with self._condition:
@@ -131,7 +176,7 @@ class SharedInferencePool:
                 raise InferenceFailure(503, message) from failure
             raise failure
 
-    def estimate(self, rgb, release_after=-1, language="zh"):
+    def estimate(self, rgb, language="zh"):
         with _language(language):
             owner = self._obtain(reserve=True)
             try:
@@ -143,28 +188,8 @@ class SharedInferencePool:
                 # model available. Only lifecycle failures become health errors.
                 raise InferenceFailure(500, f"{type(error).__name__}: {error}") from error
             finally:
-                self._release(owner, release_after)
-
-    def _release(self, owner, release_after):
-        unload = False
-        with self._condition:
-            self._active -= 1
-            self._release_pending |= release_after == 0
-            if not self._active and self._release_pending and not self._closing:
-                self._changing = True
-                self._release_pending = False
-                unload = True
-            self._condition.notify_all()
-        if unload:
-            try:
-                owner.unload()
-            except Exception as error:
                 with self._condition:
-                    self._error = f"{type(error).__name__}: {error}"
-                raise InferenceFailure(500, f"Shared model unload failed: {error}") from error
-            finally:
-                with self._condition:
-                    self._changing = False
+                    self._active -= 1
                     self._condition.notify_all()
 
     def preload(self, language="zh"):
@@ -194,6 +219,5 @@ class SharedInferencePool:
                 if success:
                     self._closed = True
                     self._owner = None
-                    self._release_pending = False
                 self._changing = False
                 self._condition.notify_all()

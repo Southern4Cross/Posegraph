@@ -8,5 +8,9 @@
   <ItemGroup>
     <Compile Include="../../Posegraph/Backend/BackendClient.cs" Link="BackendClient.cs" />
     <Compile Include="../../Posegraph/Backend/Dto.cs" Link="Dto.cs" />
+    <Compile Include="../../Posegraph/Backend/RecognitionResources.cs" Link="RecognitionResources.cs" />
+    <Compile Include="../../Posegraph/Backend/SystemProbe.cs" Link="SystemProbe.cs" />
+    <Compile Include="../Common/LoopbackServer.cs" Link="LoopbackServer.cs" />
+    <Compile Include="../Common/Stubs.cs" Link="Stubs.cs" />
   </ItemGroup>
 </Project>
