@@ -1,0 +1,293 @@
+diff --git a/Posegraph/Backend/BackendClient.cs b/Posegraph/Backend/BackendClient.cs
+index b0ba576..3c06dd7 100644
+--- a/Posegraph/Backend/BackendClient.cs
++++ b/Posegraph/Backend/BackendClient.cs
+@@ -12,9 +12,8 @@ public sealed partial class BackendClient(Func<int> port) : IDisposable
+     // 识别首次要加载模型，可能超过半分钟
+     private readonly HttpClient _http = new(new LanguageHandler()) { Timeout = TimeSpan.FromSeconds(180) };
+ 
+-    /// <summary>每个请求带上界面语言，后端返回的提示 / 错误信息按它翻译。
+-    /// 后端只在本机：不走系统代理（加速器 / 代理软件会改写请求体，后端收到的图片无法解码、连接被重置）。</summary>
+-    private sealed class LanguageHandler() : DelegatingHandler(new HttpClientHandler { UseProxy = false })
++    /// <summary>每个请求带上界面语言，后端返回的提示 / 错误信息按它翻译。</summary>
++    private sealed class LanguageHandler() : DelegatingHandler(new HttpClientHandler())
+     {
+         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+         {
+@@ -41,7 +40,7 @@ public sealed partial class BackendClient(Func<int> port) : IDisposable
+ 
+     /// <summary>运行时修改设备与释放策略（设备改动在下次加载时生效）。</summary>
+     public Task ConfigureAsync(Configuration c) => PostAsync("/model/config",
+-        new Dictionary<string, object> { ["device"] = c.BackendDevice, ["release_after"] = c.ReleaseAfter, ["mhr_on_cpu"] = c.MhrOnCpu });
++        new Dictionary<string, object> { ["device"] = c.BackendDevice, ["release_after"] = c.ReleaseAfter, ["mhr_on_cpu"] = c.MhrOnCpu, ["cuda_device"] = c.BackendGpu });
+ 
+     /// <summary>hold：同一批后面还有图要识别，这张识别完后端先不按「立即释放」卸载模型（整批结束再 UnloadModelAsync）。
+     /// parallel：批量队列的请求，后端可以共享模型并行识别（实验，见 BackendClient.Parallel.cs）。</summary>
+@@ -129,3 +128,4 @@ public sealed class BackendException(int statusCode, string message) : InvalidOp
+ {
+     public int StatusCode { get; } = statusCode;
+ }
++
+diff --git a/Posegraph/Backend/BackendProcess.cs b/Posegraph/Backend/BackendProcess.cs
+index 2768f52..84cfe31 100644
+--- a/Posegraph/Backend/BackendProcess.cs
++++ b/Posegraph/Backend/BackendProcess.cs
+@@ -62,6 +62,13 @@ public sealed class BackendProcess : IDisposable
+         psi.Environment["POSEGRAPH_BRIDGE_URL"] = $"http://127.0.0.1:{c.Port}";
+         psi.Environment["POSEGRAPH_PRELOAD"] = c.PreloadModel ? "1" : "0";
+         psi.Environment["POSEGRAPH_DEVICE"] = c.BackendDevice;
++        // 双显卡：把指定显卡设为 cuda:0（其余隐藏），并告诉后端按物理 index/UUID 查这张卡的显存
++        if (!string.IsNullOrWhiteSpace(c.BackendGpu))
++        {
++            var g = c.BackendGpu.Trim();
++            psi.Environment["CUDA_VISIBLE_DEVICES"] = g;
++            psi.Environment["POSEGRAPH_CUDA_DEVICE"] = g;
++        }
+         psi.Environment["POSEGRAPH_RELEASE_AFTER"] = c.ReleaseAfter.ToString();
+         psi.Environment["POSEGRAPH_MHR_ON_CPU"] = c.MhrOnCpu ? "1" : "0";
+         psi.Environment["POSEGRAPH_MIN_FREE_VRAM_MB"] = SystemProbe.RequiredVramMB.ToString();
+@@ -99,3 +106,4 @@ public sealed class BackendProcess : IDisposable
+ 
+     public void Dispose() => Stop();
+ }
++
+diff --git a/Posegraph/Backend/SystemProbe.cs b/Posegraph/Backend/SystemProbe.cs
+index 190c4a1..1402d2b 100644
+--- a/Posegraph/Backend/SystemProbe.cs
++++ b/Posegraph/Backend/SystemProbe.cs
+@@ -1,3 +1,4 @@
++using System.Collections.Generic;
+ using System.Diagnostics;
+ using System.Runtime.InteropServices;
+ 
+@@ -18,14 +19,33 @@ public sealed class SystemProbe
+ 
+     private DateTime _last = DateTime.MinValue;
+     private Task? _running;
++    private List<GpuEntry> _gpus = new();
++    private GpuEntry? _selected;
++    private string? _selectedSpec;
+ 
+-    public string? GpuName { get; private set; }
+-    public int? VramFreeMB { get; private set; }
+-    public int? VramTotalMB { get; private set; }
++    public string? GpuName => _selected?.Name;
++    public int? VramFreeMB => _selected?.FreeMB;
++    public int? VramTotalMB => _selected?.TotalMB;
+     public string? GpuError { get; private set; }
+     public int RamAvailMB { get; private set; }
+     public int RamTotalMB { get; private set; }
+ 
++    /// <summary>枚举到的全部 N 卡（双显卡场景用）。</summary>
++    public IReadOnlyList<GpuEntry> Gpus => _gpus;
++
++    /// <summary>界面要监视 / 使用的显卡：设置里的 BackendGpu（index 或 UUID），空为不指定（默认第一张）。</summary>
++    public string? SelectedGpuSpec
++    {
++        get => _selectedSpec;
++        set
++        {
++            var v = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
++            if (_selectedSpec == v) return;
++            _selectedSpec = v;
++            _selected = Pick(v);
++        }
++    }
++
+     /// <summary>界面每帧调用；到时间才在后台刷新。</summary>
+     public void Tick()
+     {
+@@ -45,26 +65,49 @@ public sealed class SystemProbe
+         try
+         {
+             using var p = Process.Start(new ProcessStartInfo("nvidia-smi",
+-                "--query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits")
++                "--query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader,nounits")
+             {
+                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+             })!;
+-            var line = p.StandardOutput.ReadLine();
++            var output = p.StandardOutput.ReadToEnd();
+             p.WaitForExit(3000);
+-            var parts = line?.Split(',').Select(s => s.Trim()).ToArray();
+-            if (parts is not { Length: 3 }) throw new InvalidOperationException(Loc.T("nvidia-smi 输出无法解析"));
+-            GpuName = parts[0];
+-            VramTotalMB = int.Parse(parts[1]);
+-            VramFreeMB = int.Parse(parts[2]);
++            var gpus = new List<GpuEntry>();
++            foreach (var raw in output.Split('\n', '\r'))
++            {
++                var line = raw.Trim();
++                if (line.Length == 0) continue;
++                var parts = line.Split(',').Select(s => s.Trim()).ToArray();
++                if (parts.Length != 5) continue;
++                if (!int.TryParse(parts[3], out var total)) continue;
++                if (!int.TryParse(parts[4], out var free)) continue;
++                gpus.Add(new GpuEntry(parts[0], parts[1], parts[2], free, total, total - free));
++            }
++            if (gpus.Count == 0) throw new InvalidOperationException(Loc.T("nvidia-smi 没有返回任何显卡"));
++            _gpus = gpus;
++            _selected = Pick(_selectedSpec);
+             GpuError = null;
+         }
+         catch (Exception ex)
+         {
+             GpuError = Loc.F("无法读取显存（需要 NVIDIA 显卡与驱动）：{0}", ex.Message);
+-            VramFreeMB = null;
++            _gpus = new List<GpuEntry>();
++            _selected = null;
+         }
+     }
+ 
++    private GpuEntry? Pick(string? spec)
++    {
++        if (_gpus.Count == 0) return null;
++        if (!string.IsNullOrWhiteSpace(spec))
++        {
++            var byIndex = _gpus.FirstOrDefault(g => g.Index == spec);
++            if (byIndex is not null) return byIndex;
++            var byUuid = _gpus.FirstOrDefault(g => g.Uuid.Equals(spec, StringComparison.OrdinalIgnoreCase));
++            if (byUuid is not null) return byUuid;
++        }
++        return _gpus[0];
++    }
++
+     [StructLayout(LayoutKind.Sequential)]
+     private struct MemoryStatusEx
+     {
+@@ -83,3 +126,7 @@ public sealed class SystemProbe
+     [return: MarshalAs(UnmanagedType.Bool)]
+     private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx buffer);
+ }
++
++/// <summary>系统里一张 N 卡（SystemProbe 枚举用；区别于后端的 GpuInfo）。</summary>
++public sealed record GpuEntry(string Index, string Uuid, string Name, int FreeMB, int TotalMB, int UsedMB);
++
+diff --git a/Posegraph/Configuration.cs b/Posegraph/Configuration.cs
+index 9895a68..a637d8a 100644
+--- a/Posegraph/Configuration.cs
++++ b/Posegraph/Configuration.cs
+@@ -34,6 +34,9 @@ public class Configuration : IPluginConfiguration
+     /// <summary>推理设备：auto（可用显存不足时用 CPU）/ cuda / cpu。</summary>
+     public string BackendDevice { get; set; } = "auto";
+ 
++    /// <summary>双显卡时指定用哪张物理 N 卡：nvidia-smi 的 index（如 "0" "1"）或 GPU UUID；空为不指定（用默认的 cuda:0）。改动后需重启后端才生效（设置页会自动重启）。</summary>
++    public string BackendGpu { get; set; } = "";
++
+     /// <summary>识别后空闲多少秒释放模型：0 立即释放（玩游戏时不占显存），-1 常驻。</summary>
+     public int ReleaseAfter { get; set; }
+ 
+@@ -88,3 +91,4 @@ public class Configuration : IPluginConfiguration
+     /// <summary>0.3.4～0.3.10 按预设自动保存的调整值。已不再使用：新图片一律用默认值，每张图的值随「保存修正」存进这张图（留着字段免得旧配置读不进来）。</summary>
+     public Dictionary<string, RetargetParams> SavedParams { get; set; } = new();
+ }
++
+diff --git a/Posegraph/UI/MainWindow.cs b/Posegraph/UI/MainWindow.cs
+index 731ee72..a60e5b7 100644
+--- a/Posegraph/UI/MainWindow.cs
++++ b/Posegraph/UI/MainWindow.cs
+@@ -58,9 +58,6 @@ public sealed partial class MainWindow : Window, IDisposable
+     /// <summary>打开 / 关闭图库窗口（由 Plugin 接上）。</summary>
+     public Action? ToggleLibrary { get; set; }
+ 
+-    /// <summary>主窗口关闭时（关闭按钮、指令、退出 GPose 自动关闭）调用：图库、角色列表跟着关（由 Plugin 接上）。</summary>
+-    public Action? Closed { get; set; }
+-
+     /// <summary>辅助视角菜单（由 Plugin 接上，与图库右键共用）。</summary>
+     public AuxViewsMenu? AuxMenu { get; set; }
+     private readonly SystemProbe _probe = new();
+@@ -76,6 +73,7 @@ public sealed partial class MainWindow : Window, IDisposable
+     // 后端状态
+     private Health? _health;
+     private string? _healthError;
++    private bool _gpuSelectionChanged;
+     private DateTime _lastHealth = DateTime.MinValue;
+     private Task? _healthTask;
+ 
+@@ -144,11 +142,7 @@ public sealed partial class MainWindow : Window, IDisposable
+         _server = server;
+         _client = new BackendClient(() => _config.BackendPort);
+         Library = new ImageLibrary(pi.GetPluginConfigDirectory());
+-        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0)
+-        {
+-            Parallelism = () => _config.BatchRecognitionParallelism,
+-            ToPng = image => TextureImages.ToPngAsync(_textures, _readback, image),
+-        };
++        Recognition = new RecognitionService(Library, _client, () => _config.ReleaseAfter == 0) { Parallelism = () => _config.BatchRecognitionParallelism };
+         Library.AuxChanged += OnAuxChanged;
+         _process = new BackendProcess();
+         _preset = config.DefaultPreset;
+@@ -170,8 +164,6 @@ public sealed partial class MainWindow : Window, IDisposable
+ 
+     public override void PostDraw() => PosegraphTheme.Pop();
+ 
+-    public override void OnClose() => Closed?.Invoke();
+-
+     public void OpenSettings()
+     {
+         IsOpen = true;
+@@ -371,6 +363,7 @@ public sealed partial class MainWindow : Window, IDisposable
+ 
+     private void DrawStatusBar()
+     {
++        _probe.SelectedGpuSpec = _config.BackendGpu;   // 让状态栏的显存显示跟随所选显卡
+         // Brio
+         var brio = _pi.InstalledPlugins.FirstOrDefault(p => p.InternalName == "Brio");
+         var brioIpc = brio is { IsLoaded: true } && _brio.IsAvailable();
+@@ -1835,7 +1828,23 @@ public sealed partial class MainWindow : Window, IDisposable
+         using (ImRaii.Disabled(_config.ReleaseAfter == 0))
+             changed |= Check(Loc.T("启动后预加载模型"), _config.PreloadModel, v => _config.PreloadModel = v,
+                              Loc.T("首次识别不用等加载；“识别后立即释放”时无效"));
+-        if (modelChanged && BackendOnline)
++        bool gpuRestart = false;
++        if (_gpuSelectionChanged)
++        {
++            _gpuSelectionChanged = false;
++            changed = true;
++            gpuRestart = true;
++            if (BackendOnline)
++                _ = Run(async () =>
++                {
++                    await StopBackendAndWaitAsync();
++                    await StartAndCheckAsync("");
++                    SetStatus(Loc.T("已切换显卡，后端已重启"), Green);
++                });
++            else
++                SetStatus(Loc.T("已记录显卡选择，下次启动后端时生效"), Green);
++        }
++        if (modelChanged && BackendOnline && !gpuRestart)
+             _ = Run(async () => { await _client.ConfigureAsync(_config); SetStatus(Loc.T("已更新识别设备设置（下次加载生效）")); });
+         changed |= modelChanged;
+         changed |= Check(Loc.T("退出时关闭插件启动的后端"), _config.StopBackendOnExit, v => _config.StopBackendOnExit = v);
+@@ -1944,6 +1953,26 @@ public sealed partial class MainWindow : Window, IDisposable
+             }
+             ItemTip(Loc.T(tip));
+         }
++        // 双显卡：选择用哪张物理 N 卡
++        ImGui.Text(Loc.T("指定显卡（双显卡）"));
++        ItemTip(Loc.T("多张 N 卡时选择用哪一张跑识别；留空为不指定（用默认的 cuda:0）。改动后需重启后端，本页会自动重启。"));
++        var gpuItems = new List<(string Value, string Label)> { ("", Loc.T("自动（不指定）")) };
++        foreach (var g in _probe.Gpus)
++            gpuItems.Add((g.Index, Loc.F("{0}｜可用 {1:0.0}/{2:0.0} GB", g.Name, g.FreeMB / 1024f, g.TotalMB / 1024f)));
++        var gpuCur = _config.BackendGpu;
++        if (!string.IsNullOrEmpty(gpuCur) && gpuItems.All(i => i.Value != gpuCur)) gpuCur = "";  // 选中的卡不见了（如被禁用），回退到自动
++        var gpuLabel = gpuItems.First(i => i.Value == gpuCur).Label;
++        var gpuW = Math.Max(220 * ImGuiHelpers.GlobalScale, ImGui.GetContentRegionAvail().X - 40);
++        ImGui.SetNextItemWidth(gpuW);
++        if (ImGui.BeginCombo(Loc.T("##gpuSelect"), UiText.ComboPreview(gpuLabel, gpuW)))
++        {
++            foreach (var (val, lbl) in gpuItems)
++                if (ImGui.Selectable(lbl, val == gpuCur))
++                {
++                    if (_config.BackendGpu != val) { _config.BackendGpu = val; _gpuSelectionChanged = true; }
++                }
++            ImGui.EndCombo();
++        }
+         // 下拉框占满到右侧标签前（英文选项更长），放不下时省略
+         var releaseW = Math.Max(180 * ImGuiHelpers.GlobalScale, ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(Loc.T("模型释放")).X - ImGui.GetStyle().ItemInnerSpacing.X);
+         ImGui.SetNextItemWidth(releaseW);
+@@ -1975,3 +2004,4 @@ public sealed partial class MainWindow : Window, IDisposable
+         return changed;
+     }
+ }
++

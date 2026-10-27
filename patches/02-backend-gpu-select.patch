@@ -1,0 +1,247 @@
+--- a/backend/src/posegraph/gpu.py
++++ b/backend/src/posegraph/gpu.py
+@@ -1,28 +1,55 @@
+-"""显卡状态（nvidia-smi）。不初始化 CUDA：在 CPU 模式或模型未加载时调用 torch.cuda 会建出几百 MB 的 CUDA 上下文。"""
++"""显卡状态（nvidia-smi）。不初始化 CUDA：在 CPU 模式或模型未加载时调用 torch.cuda 会建出几百 MB 的 CUDA 上下文。
++
++双显卡扩展：list_gpus() 枚举全部物理 N 卡；query_gpu(gpu_id=...) 可指定按物理 index 或 UUID 取某张卡的显存，
++其余逻辑与原先一致（gpu_id 为空取第一张，对应 cuda:0 / 默认 CUDA_VISIBLE_DEVICES）。
++"""
+ 
+ from __future__ import annotations
+ 
+ import subprocess
+ import time
+ 
+-_cache: tuple[float, dict | None] = (0.0, None)
++_cache: tuple[float, list | None] = (0.0, None)
+ 
+ 
+-def query_gpu(max_age: float = 2.0) -> dict | None:
+-    """{name, totalMB, usedMB, freeMB}；没有 N 卡或驱动时返回 None。结果缓存 max_age 秒。"""
++def list_gpus(max_age: float = 2.0) -> list[dict] | None:
++    """返回所有物理 N 卡的列表（按 nvidia-smi index 顺序）：
++    {index, uuid, name, totalMB, usedMB, freeMB}；没有 N 卡或驱动时返回 None。结果缓存 max_age 秒。"""
+     global _cache
+     if time.monotonic() - _cache[0] < max_age:
+         return _cache[1]
+-    info = None
++    gpus: list[dict] | None = None
+     try:
+         out = subprocess.run(
+-            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
++            ["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,memory.free",
++             "--format=csv,noheader,nounits"],
+             capture_output=True, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+         ).stdout.strip().splitlines()
+-        if out:
+-            name, total, used, free = (s.strip() for s in out[0].split(","))
+-            info = {"name": name, "totalMB": int(total), "usedMB": int(used), "freeMB": int(free)}
++        result: list[dict] = []
++        for line in out:
++            parts = [s.strip() for s in line.split(",")]
++            if len(parts) != 6:
++                continue
++            idx, uuid, name, total, used, free = parts
++            result.append({"index": idx, "uuid": uuid, "name": name,
++                           "totalMB": int(total), "usedMB": int(used), "freeMB": int(free)})
++        gpus = result or None
+     except (OSError, ValueError, subprocess.SubprocessError):
+-        info = None
+-    _cache = (time.monotonic(), info)
+-    return info
++        gpus = None
++    _cache = (time.monotonic(), gpus)
++    return gpus
++
++
++def query_gpu(max_age: float = 2.0, gpu_id: str | None = None) -> dict | None:
++    """{name, index, uuid, totalMB, usedMB, freeMB}；没有 N 卡或驱动时返回 None。
++    gpu_id 为空取第一张（对应 cuda:0 / 默认 CUDA_VISIBLE_DEVICES）；否则按物理 index 或 UUID 取指定卡。
++    结果缓存 max_age 秒。"""
++    gpus = list_gpus(max_age)
++    if not gpus:
++        return None
++    if gpu_id:
++        for g in gpus:
++            if g["index"] == str(gpu_id) or g["uuid"].lower() == str(gpu_id).lower():
++                return g
++        return None
++    return gpus[0]
+--- a/backend/src/posegraph/config.py
++++ b/backend/src/posegraph/config.py
+@@ -29,6 +29,10 @@
+     mhr_on_cpu: bool = field(default_factory=lambda: _env("MHR_ON_CPU", "1") == "1")
+     # auto 模式下选 GPU 所需的最低可用显存（MB）：MHR 放 CPU 时模型峰值约 2GB，另加 CUDA 上下文与余量
+     min_free_vram_mb: int = field(default_factory=lambda: int(_env("MIN_FREE_VRAM_MB", "3000")))
++
++    # 双显卡时指定的物理 N 卡：nvidia-smi 的 index（如 "0" "1"）或 GPU UUID；空为不指定（用默认 cuda:0）。
++    # 插件会在启动时把它同时写进 CUDA_VISIBLE_DEVICES（把这张卡映射成唯一 cuda:0）与 POSEGRAPH_CUDA_DEVICE。
++    cuda_device: str = field(default_factory=lambda: _env("CUDA_DEVICE", ""))
+     # 识别完成后多少秒释放模型：0 立即释放，-1 常驻
+     release_after: float = field(default_factory=lambda: float(_env("RELEASE_AFTER", "0")))
+ 
+@@ -44,3 +48,24 @@
+ 
+ 
+ settings = Settings()
++
++# 双显卡：把指定的物理 N 卡映射成唯一的 cuda:0（其余隐藏），再让 PyTorch 用 cuda:0。
++# 关键：数值索引在 nvidia-smi 与 CUDA 中的含义可能不同（CUDA 默认 FASTEST_FIRST，多卡/eGPU 时
++# 顺序可能与 nvidia-smi 相反），这里统一解析成 GPU UUID 再写入——UUID 与枚举顺序无关，永远指向
++# 同一张物理卡，避免“界面显示 1650、实际跑 5060”这类错位。必须在任何 torch / CUDA 库导入之前执行。
++_spec = (settings.cuda_device or os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
++if _spec:
++    # 万一 UUID 解析失败、只能退回数值索引时，让数值索引与 nvidia-smi 一致。
++    # 仅在明确指定了卡时设置；不指定时保持库默认（FASTEST_FIRST，自动用最强卡）。
++    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
++    _target = _spec
++    try:
++        from .gpu import list_gpus
++
++        for _g in (list_gpus(max_age=0) or []):
++            if _g["index"] == _spec or _g["uuid"].lower() == _spec.lower():
++                _target = _g["uuid"]
++                break
++    except Exception:
++        pass  # 查不到 nvidia-smi 时保持原样
++    os.environ["CUDA_VISIBLE_DEVICES"] = _target
+--- a/backend/src/posegraph/estimators/__init__.py
++++ b/backend/src/posegraph/estimators/__init__.py
+@@ -16,5 +16,6 @@
+             precision=settings.precision,
+             mhr_on_cpu=settings.mhr_on_cpu,
+             min_free_vram_mb=settings.min_free_vram_mb,
++            cuda_device=settings.cuda_device,
+         )
+     raise ValueError(f"未知的估计器：{name}")
+--- a/backend/src/posegraph/estimators/sam3d_body.py
++++ b/backend/src/posegraph/estimators/sam3d_body.py
+@@ -112,13 +112,13 @@
+ 
+ class Sam3dBodyEstimator(PoseEstimator):
+     """device：auto 时按 nvidia-smi 的可用显存决定（低于 min_free_vram_mb 用 CPU），每次加载时重新判断；
+-    precision：auto 时 GPU 用 bf16（上游默认）、CPU 用 fp32（多数 CPU 没有 bf16 硬件，反而更慢）；
++    precision：auto 时 GPU 用 bf16（Ampere 及以上；更老架构如 Turing 无 bf16 硬件则退回 fp16）、CPU 用 fp32；
+     mhr_on_cpu：GPU 模式下把 MHR 留在 CPU。"""
+ 
+     name = "sam3d_body"
+ 
+     def __init__(self, repo_dir: Path, checkpoint_dir: Path, device: Device = "auto", precision: Precision = "auto",
+-                 share_mhr: bool = True, mhr_on_cpu: bool = True, min_free_vram_mb: int = 3000):
++                 share_mhr: bool = True, mhr_on_cpu: bool = True, min_free_vram_mb: int = 3000, cuda_device: str = ""):
+         self.repo_dir = Path(repo_dir)
+         self.checkpoint_dir = Path(checkpoint_dir)
+         self.device = device
+@@ -126,6 +126,8 @@
+         self.share_mhr = share_mhr
+         self.mhr_on_cpu = mhr_on_cpu
+         self.min_free_vram_mb = min_free_vram_mb
++        # 双显卡：指定的物理 N 卡（index 或 UUID）；空为不指定（用默认 cuda:0）
++        self.cuda_device = cuda_device
+         # 加载后实际使用的设备 / 精度，以及选择原因
+         self.active_device: str | None = None
+         self.active_precision: str | None = None
+@@ -137,6 +139,20 @@
+         return self._estimator is not None
+ 
+     def _pick_device(self) -> str:
++        # 双显卡：用户显式指定了物理卡，优先用它（即便显存偏紧），除非强制 CPU
++        spec = (self.cuda_device or "").strip()
++        if spec:
++            from ..gpu import query_gpu
++            g = query_gpu(max_age=0, gpu_id=spec)
++            if g is None:
++                self.device_reason = ("找不到指定的显卡「{spec}」，已退回 CPU", {"spec": spec})
++                return "cpu"
++            if self.device == "cpu":
++                self.device_reason = ("手动指定",)
++                return "cpu"
++            self.device_reason = ("指定显卡：{name}", {"name": g["name"]})
++            return "cuda"
++        # 未指定物理卡：沿用原逻辑（auto 按第一张卡显存决定，cuda/cpu 直接返回）
+         if self.device != "auto":
+             self.device_reason = ("手动指定",)
+             return self.device
+@@ -172,7 +188,15 @@
+             from sam_3d_body import SAM3DBodyEstimator
+ 
+         device = self._pick_device()
+-        precision = self.precision if self.precision != "auto" else ("bf16" if device == "cuda" else "fp32")
++        if self.precision != "auto":
++            precision = self.precision
++        elif device == "cpu":
++            precision = "fp32"
++        else:
++            # bf16 需要 Ampere 及以上（compute capability >= 8.0）；更老架构（Turing/Pascal 等）
++            # 没有 bf16 硬件，硬上会极慢或报错，退回 fp16（Turing 有 fp16 Tensor Core，能正常跑）。
++            _cap = torch.cuda.get_device_capability(0)
++            precision = "bf16" if _cap[0] >= 8 else "fp16"
+         try:
+             model, cfg = self._build(ckpt, mhr, device, precision)
+         except torch.OutOfMemoryError:
+--- a/backend/src/posegraph/app.py
++++ b/backend/src/posegraph/app.py
+@@ -37,7 +37,7 @@
+ from .config import SERVICE_ROOT, settings
+ from .estimators import create_estimator
+ from . import RUNTIME_REQUIRED, __version__
+-from .gpu import query_gpu
++from .gpu import query_gpu, list_gpus
+ from .i18n import set_language, tr
+ from .retarget import races
+ from .retarget.brio_pose import BrioPose
+@@ -124,7 +124,8 @@
+             "deviceReason": _reason(getattr(_estimator, "device_reason", ("",))),
+             "config": {"device": getattr(_estimator, "device", None), "releaseAfter": _release_after,
+                        "mhrOnCpu": getattr(_estimator, "mhr_on_cpu", None),
+-                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None)}}
++                       "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None),
++                       "cudaDevice": getattr(_estimator, "cuda_device", None)}}
+ 
+ 
+ def _reason(r) -> str:
+@@ -137,8 +138,20 @@
+ @app.get("/health")
+ def health() -> dict:
+     # 显卡信息走 nvidia-smi：模型不在 GPU 上时不能为了查询去初始化 CUDA（会常驻几百 MB 显存）
++    spec = (settings.cuda_device or "").strip()
++    gpu = query_gpu(gpu_id=spec or None)
++    if gpu is None and spec:
++        gpu = query_gpu()  # 指定的卡读不到，退回第一张，至少给个状态
+     return {"status": "ok", "version": app.version, "runtime": RUNTIME_REQUIRED, "estimator": _estimator.name, "model": _model_info(),
+-            "gpu": query_gpu(), "sessions": len(_sessions)}
++            "gpu": gpu, "sessions": len(_sessions)}
++
++
++@app.get("/gpus")
++def gpus() -> dict:
++    """枚举系统里的全部物理 N 卡，以及当前后端被指定的那张（POSEGRAPH_CUDA_DEVICE）。双显卡选择用。"""
++    spec = (settings.cuda_device or "").strip()
++    selected = query_gpu(gpu_id=spec or None) if spec else None
++    return {"gpus": list_gpus() or [], "selected": spec or None, "selectedInfo": selected}
+ 
+ 
+ @app.post("/model/load")
+@@ -166,17 +179,19 @@
+     release_after: float | None = None  # 秒；0 立即释放，-1 常驻
+     mhr_on_cpu: bool | None = None
+     min_free_vram_mb: int | None = None
++    cuda_device: str | None = None      # 双显卡：指定物理 N 卡（index / UUID），空为不指定
+ 
+ 
+ @app.post("/model/config")
+ def model_config(cfg: ModelConfig) -> dict:
+-    """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。"""
++    """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。
++    cuda_device 改动需要重启后端才真正换卡（CUDA_VISIBLE_DEVICES 只能在 torch 加载前设置）。"""
+     global _release_after
+     if cfg.device is not None and cfg.device not in ("auto", "cuda", "cpu"):
+         raise HTTPException(400, tr("device 只能是 auto / cuda / cpu"))
+     with _model_lock:
+         reload = False
+-        for key in ("device", "mhr_on_cpu", "min_free_vram_mb"):
++        for key in ("device", "mhr_on_cpu", "min_free_vram_mb", "cuda_device"):
+             value = getattr(cfg, key)
+             if value is not None and getattr(_estimator, key) != value:
+                 setattr(_estimator, key, value)
